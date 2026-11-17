@@ -1,0 +1,2 @@
+pycryptodome==4.5.0
+Markdown==3.11.3

@@ -1,0 +1,24 @@
+# Vendor downloads, generated images, device data and local research stay private.
+/work/
+/private/
+/output/
+/_site/
+/.venv/
+/.playwright-cli/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.bcd
+*.bin
+*.UPG
+*.upg
+*.apk
+*.zip
+*.tar
+*.gz
+*.pcap
+*.pcapng
+*.pdf
+*.pem
+*.key
+*.jsonl
