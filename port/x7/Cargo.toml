@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["protocol", "transport", "registers", "control", "management", "kernel", "image"]
+default-members = ["protocol", "transport", "registers", "control", "management", "image"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.kernel]
+inherits = "release"
+strip = false
