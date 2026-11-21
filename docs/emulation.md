@@ -10,6 +10,7 @@ and verified loading addresses; it does not host Sony binaries or private NAND.
 | QEMU image lab in this repository | Load exact X7 network/controller images into a paused CPU/RAM environment, inspect them through GDB, verify memory against the local input |
 | Instruction-level checks | Shell-routing, manifest and SPI routines executed with selected OS/peripheral behavior modeled |
 | zd1 Renode model | Related DM870 network module and B&W AVR32 board; substantial boot/peripheral support, with documented limitations |
+| X7 port of the Renode model | Boots the replacement Linux network module on a copy of the research NAND. A test peer supplies Sony controller messages. |
 | Complete SRS-X7 emulation | Not established; Sony controller and board integration remain incomplete |
 
 QEMU 11.1.3 has no DM870/SRS-X7 board model. This tool uses the `none` machine
@@ -86,14 +87,11 @@ python3 emu/zemu run stock --keep
 ```
 
 `setup` downloads zd1's reference inputs, and its build path uses Nix. Its
-AVR32 controller model is specific to the B&W board. The SPI test host needs
-the X7 CRC extension described in [SPI reading](spi.md).
+AVR32 controller model is specific to the B&W board. The X7 research port
+adds a test peer that supplies the Sony framing and controller responses.
 
-## Requirements for full X7 hosting
+## Scope of the X7 model
 
-A useful system model needs the network module's boot/memory/peripheral
-behavior and a Sony-compatible controller endpoint, connected with the actual
-CRC, escaping, notification and handshake behavior. The firmware-derived mode,
-clock divider, DMA path and GPIO functions now provide concrete inputs.
-The remaining validation includes the P1 clock tree, physical timings,
-controller startup/state transitions and audio routing.
+The X7 model supports A/B boot selection, wired rescue and the digital audio
+path. A software peer supplies Armada’s controller responses. Radio reception,
+analogue audio and speaker output require physical hardware.

@@ -41,8 +41,8 @@ are preserved without assigning speculative meaning. The tool verifies the
 stock hash, section CRCs and string bounds, then writes the catalogue locally;
 it does not connect to the speaker.
 
-The original live dump added `0x40`, `0xbe` and `0xdc`, producing a combined
-catalogue of 131 registers, with 112 present in the captured runtime state.
+The running firmware exposes three additional register IDs, `0x40`, `0xbe`
+and `0xdc`, beyond the 128 descriptors in the stock image.
 
 ## Transport framing
 
@@ -227,8 +227,9 @@ body reception, validation, retry, result dispatch and cleanup:
 Static timer constants include 3000, 1000, 100 and 5 ticks. Their tick rate and
 physical deadlines still require validation.
 
-## Remaining measurements
+## Hardware limits
 
-The P1 clock source/frequency, countdown timer tick and higher-level
-boot/source/volume/power states remain partly unresolved. No controller-flash
-read command has been identified on this SPI interface.
+The controller and network module exchange startup, source-selection, EQ,
+volume and standby messages. The stock history records decoded headers.
+The Linux driver records requests and replies at the protocol level. The
+electrical clock rate and countdown timer tick are unverified.

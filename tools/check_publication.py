@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 TEXT_SUFFIXES = {".md", ".txt", ".py", ".css", ".html", ".yml", ".yaml"}
 TEXT_NAMES = {"LICENSE", ".gitignore"}
+PORT_SUFFIXES = {".rs", ".toml", ".nix", ".c", ".S", ".ld", ".js"}
 
 
 def check_candidates():
@@ -22,7 +23,9 @@ def check_candidates():
         path = ROOT / name
         if path.is_symlink() or not path.is_file():
             raise ValueError(f"non-regular public file: {name}")
-        if path.suffix not in TEXT_SUFFIXES and path.name not in TEXT_NAMES:
+        port_source = name.startswith("firmware/port/") and path.suffix in PORT_SUFFIXES
+        kit_input = name in {"firmware/port/x7/Cargo.lock", "firmware/zd1-port.patch"}
+        if path.suffix not in TEXT_SUFFIXES and path.name not in TEXT_NAMES and not (port_source or kit_input):
             raise ValueError(f"unapproved public artifact type: {name}")
         raw = path.read_bytes()
         if b"\0" in raw:

@@ -1,38 +1,27 @@
-# Replacement firmware requirements
+# Custom firmware on the SRS-X7
 
-## Related platform
+Linux replaces the operating system on the X7’s network module. Sony’s Armada
+controller still selects the audio source, applies the factory speaker tuning
+and drives the amplifiers.
 
-[zd1](https://github.com/pawlowskialex/zd1) targets the Bowers & Wilkins
-Zeppelin Air on the same broad DM870/KnOS lineage. It provides substantial
-boot, networking, codec, audio and receiver code. The reference version is
-commit `1cd511c0d37a758d6267675664bf78abd36a8ee6`.
-
-The Sony controller differs from the Zeppelin's AVR32. The current zd1 path
-uses its own controller dialect, and the maintainer explains the cost of
-supporting stock controllers in [the compatibility discussion](https://github.com/pawlowskialex/zd1/issues/1).
-A generic zd1 image or B&W controller patch is not an X7 installer.
-
-## Required work
-
-| Area | Required support |
+| Feature | SRS-X7 support |
 | --- | --- |
-| Main controller | Flash readback, update wrapper and per-unit storage layout |
-| Sony SPI protocol | Boot, notification, source, volume, mute and standby state machines |
-| Recovery | Restore path for modified boot/application images |
-| Network-module boot | Sony controller handshake and power control |
-| Audio | PCM output, volume, mute and standby/wake |
-| AirPlay 2 | Current sender support, synchronization and control |
-| Spotify Connect | Authentication, track-key acquisition and playback |
-| Cast | Device authentication and sender compatibility |
+| Local playback | Plays through the built-in speakers. |
+| AirPlay 2 over Ethernet | Receives buffered Apple Lossless (ALAC) and sends it to the digital audio output. Audible playback from an AirPlay sender is unconfirmed. |
+| Sound controls | The local dashboard displays the controller’s volume and EQ. The controller supports five adjustable EQ bands. |
+| Standby settings | Linux can read the network standby and automatic standby settings. Overnight standby and wake are unverified. |
+| Management | The dashboard uses an owner password. SSH accepts the owner’s Ed25519 key. |
+| Recovery | Two bootable system slots support rollback to the confirmed system. Wired rescue is available with intact bootloaders. |
 
-Retaining Sony's controller requires implementing its network-side SPI
-protocol. The network module also needs a maintained OS and driver base.
+Wi-Fi streaming, AirPlay multiroom synchronization and Spotify Connect
+playback are unverified. Google Cast is unsupported.
 
-## Related devices
+## Getting the firmware
 
-The SA-NS400 and Zeppelin are research references. The SRS-X9 shares useful
-manifest/platform context but has different firmware. SRS-X77/X88/X99 are
-newer, materially different software platforms.
+Version 0.1.0 is a source kit. It builds on Alex Pawlowski’s **zd1** firmware
+for the Zeppelin Air and adds the X7 controller protocol, audio routing and
+image packaging. Supply your own Sony stock update, matching Nokia kernel
+and drivers, and SSH public key. The stock input is SRS-X7 version 2.13.2.09.
+A fresh installation on a factory-stock X7 is unverified.
 
-Useful related work includes [Pioneer X-SMC55 research](https://github.com/loop333/pioneer-x-smc55)
-and [libretouch's hardware notes](https://libretouch.net/docs/hardware/).
+[Download the source kit](https://github.com/davelindo/srs-revival/releases/tag/x7-source-0.1.0) · [Build instructions](https://github.com/davelindo/srs-revival/blob/x7-source-0.1.0/README.md) · [Board and audio path](hardware.md)

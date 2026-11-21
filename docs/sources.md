@@ -12,8 +12,10 @@
   AC-power and uninterrupted-update requirements.
 - [Sony 2014 launch release and specifications](https://www.sony-asia.com/corporate/resources/en_AP/pdf/AP%2807January14%29-UnitingOutstandingDesignandPremiumSoundtheNewWirelessSpeakersandAudioSystemsfromSony.pdf).
   Product generation, interfaces and 2.1-channel speaker system.
-- [Sony service-manual parts list, hosted by ManualsLib, page 67](https://www.manualslib.com/manual/3362414/Sony-Srs-X7.html?page=67).
-  Factual identities for IC401/402/403/406. No manual or schematic is hosted here.
+- Sony SRS-X7 service manual, main-board diagram on page 29 and parts list on
+  page 67. These identify the digital audio route and IC401/402/403/406.
+  Sony also provides the owner's reference and setup guides.
+  [Official SRS-X7 owner manuals](https://www.sony.ca/en/electronics/support/product/srs-x7/manuals)
 
 Vendor download paths and file hashes are listed in [the update format](update-format.md).
 
@@ -36,6 +38,14 @@ Vendor download paths and file hashes are listed in [the update format](update-f
 
 Adapted code and its retained MIT notice are identified in the repository's
 [third-party notices](https://github.com/davelindo/srs-revival/blob/main/THIRD_PARTY.md).
+
+## Component licensing
+
+The pinned upstream notice identifies the origin of the Nokia kernel and
+the licenses of the receiver, codecs and audio libraries. The publication
+notes explain how those dependencies affect distribution of the X7 port.
+[Upstream notices](https://github.com/pawlowskialex/zd1/blob/1cd511c0d37a758d6267675664bf78abd36a8ee6/NOTICE.md)
+· [Downloads and licensing](sharing.md)
 
 For project questions and corrections, use the public issue tracker.
 [SRS Revival issues](https://github.com/davelindo/srs-revival/issues)

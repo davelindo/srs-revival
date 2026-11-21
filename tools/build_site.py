@@ -11,13 +11,14 @@ import markdown
 ROOT = Path(__file__).resolve().parents[1]
 PAGES = (
     ("index", "Overview"),
+    ("roadmap", "Custom firmware"),
+    ("sharing", "Downloads and licensing"),
     ("hardware", "Device architecture"),
     ("spi", "SPI reading"),
     ("telnet", "Enable telnet"),
     ("update-format", "Firmware format"),
     ("emulation", "Local emulation"),
-    ("preservation", "Backup coverage"),
-    ("roadmap", "Future firmware"),
+    ("preservation", "Backup and recovery"),
     ("sources", "Sources"),
 )
 
@@ -49,6 +50,8 @@ def main():
                                        source=f"https://github.com/davelindo/srs-revival/blob/main/docs/{slug}.md")
         (output / f"{slug}.html").write_text(rendered, encoding="utf-8")
     shutil.copyfile(ROOT / "site/style.css", output / "style.css")
+    owner_guide = ROOT / "docs/srs-x7.txt"
+    shutil.copyfile(owner_guide, output / owner_guide.name)
     (output / ".nojekyll").touch()
     print(f"Built {len(PAGES)} pages in {output}")
 

@@ -1,0 +1,2619 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3951,6 +3952,26 @@
+ ]
+
+ [[package]]
++name = "x7-protocol"
++version = "0.1.0"
++
++[[package]]
++name = "x7-registers"
++version = "0.1.0"
++dependencies = [
++ "x7-protocol",
++ "x7-transport",
++]
++
++[[package]]
++name = "x7-transport"
++version = "0.1.0"
++dependencies = [
++ "dm870",
++ "x7-protocol",
++]
++
++[[package]]
+ name = "yoke"
+ version = "0.8.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -3983,7 +4004,6 @@
+  "zd1-ctl",
+  "zd1-entropy",
+  "zd1-init",
+- "zd1-linkd",
+  "zd1-memsh",
+  "zd1-net",
+  "zd1-persparam",
+@@ -3992,7 +4012,6 @@
+  "zd1-slot",
+  "zd1-snapcast",
+  "zd1-spotify",
+- "zd1-update",
+ ]
+
+ [[package]]
+@@ -4022,6 +4041,7 @@
+ version = "0.1.0"
+ dependencies = [
+  "alsa",
++ "dm870",
+  "nix",
+  "tracing",
+  "tracing-subscriber",
+@@ -4033,6 +4053,7 @@
+ version = "0.1.0"
+ dependencies = [
+  "dm870",
++ "x7-transport",
+ ]
+
+ [[package]]
+@@ -4041,7 +4062,9 @@
+ dependencies = [
+  "dm870",
+  "miniz_oxide 0.8.9",
+- "zd1-link",
++ "x7-protocol",
++ "x7-registers",
++ "x7-transport",
+ ]
+
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,6 +5,7 @@
+ # and `cargo boot` (.cargo/config.toml), as nix runs them (nix/module/apps.nix, nix/boot.nix).
+ [workspace]
+ resolver = "2"
++exclude = ["x7"]
+ members = [
+   "protocol/spi",
+   "protocol/host",
+@@ -62,7 +63,6 @@
+ zd1-compat = { path = "module/os/apps/zd1-compat" }
+ zd1-entropy = { path = "module/os/apps/zd1-entropy" }
+ zd1-init = { path = "module/os/apps/zd1-init", default-features = false }
+-zd1-linkd = { path = "module/os/apps/zd1-linkd" }
+ zd1-mdns = { path = "module/os/apps/zd1-mdns" }
+ zd1-memsh = { path = "module/os/apps/zd1-memsh" }
+ zd1-net = { path = "module/os/apps/zd1-net" }
+@@ -70,11 +70,11 @@
+ zd1-selftest = { path = "module/os/apps/zd1-selftest" }
+ zd1-settings = { path = "module/os/apps/zd1-settings" }
+ zd1-slot = { path = "module/os/apps/zd1-slot" }
++zd1-update = { path = "module/os/apps/zd1-update" }
+ zd1-snapcast = { path = "module/os/apps/zd1-snapcast" }
+ zd1-spotify = { path = "module/os/apps/zd1-spotify" }
+ zd1-svc = { path = "module/os/apps/zd1-svc" }
+ zd1-sys = { path = "module/os/apps/zd1-sys" }
+-zd1-update = { path = "module/os/apps/zd1-update" }
+ zd1-airplay = { path = "module/os/apps/zd1-airplay" }
+
+ # our forks (module/os/forks.md)
+diff --git a/flake.nix b/flake.nix
+--- a/flake.nix
++++ b/flake.nix
+@@ -67,6 +67,7 @@
+         "apps"
+         "apps-core"
+         "apps-debug"
++        "apps-profile"
+         "debug-tools"
+       ];
+       packages = nixpkgs.lib.mapAttrs (
+diff --git a/module/boot/Cargo.toml b/module/boot/Cargo.toml
+--- a/module/boot/Cargo.toml
++++ b/module/boot/Cargo.toml
+@@ -13,6 +13,8 @@
+
+ [dependencies]
+ dm870.workspace = true
+-zd1-link.workspace = true
++x7-protocol = { path = "../../x7/protocol" }
++x7-transport = { path = "../../x7/transport" }
++x7-registers = { path = "../../x7/registers" }
+ # the kernel stored as raw deflate (module/os/mkpayload.py --deflate-kernel); no_std, no allocation
+ miniz_oxide = { version = "0.8", default-features = false }
+diff --git a/module/boot/src/bin/linuxboot.rs b/module/boot/src/bin/linuxboot.rs
+--- a/module/boot/src/bin/linuxboot.rs
++++ b/module/boot/src/bin/linuxboot.rs
+@@ -2,19 +2,13 @@
+ //! linuxboot.ld).
+ //! The app image entered at 0x60008000 is [trampoline | header @0x40 | this stub | kernel Image | initramfs]; the
+ //! trampoline has copied us to 0x61F00000. We:
+-//!   1. bring up the MCU link (stock SPI register protocol, module/link); our text goes to UART1, the console.
+-//!      Status BOOTING (0x2000), not READY: the stock MCU takes READY as "start the setup task", which then ran into
+-//!      the silent kernel boot and never finished after a module restart (Wi-Fi source stuck, LED breathing red;
+-//!      dev/stock-os). To it BOOTING is "not usable yet, keep polling"; zd1-linkd says READY once Linux is up. BL2 is
+-//!      reached through BL1's serial menu (`zd1 module esc`) whatever happens here;
+-//!   2. with the slots flag (header +0x2C bit 0: the module OS's image, docs/module/storage.md): ask the MCU what to
+-//!      start. We say "zd1-boot" on reg 0x25 and wait up to 5 s for its answer on reg 0xC4 (b0: slot A, slot B or the
+-//!      rescue, b1: the good slot; our MCU firmware, mcu/src/modboot.c). A slot is the root file system (JFFS2 on its
+-//!      MTD partition, read-only: the initramfs is left out), the rescue is the initramfs. No answer (the MCU's
+-//!      bootloader relaying an image, the stock MCU firmware): the rescue. Without the MCU we don't know which slot is
+-//!      good, and a slot may hold an old system or none (an empty one panics, and the module restarts into it again);
+-//!      the rescue is always there, and its zd1-linkd takes the bootloader's HCR 0x21 into BL2. Without the flag the
+-//!      initramfs is the system (the emulator's dev boot);
++//!   1. bring up Sony's CRC-protected SPI endpoint; text goes to UART1, the console.
++//!      The X7 Armada leaves its startup callback armed on status zero. The Linux controller service publishes
++//!      0x2100 once it can handle commands. A 0x2000 reply would complete the Armada's alternate startup branch.
++//!      Independent BL2 entry on Sony is unverified; the B&W `zd1 module esc` relay does not apply to this unit;
++//!   2. with the slots flag (header +0x2C bit 0), enter the recovery initramfs for local system selection. Sony's
++//!      controller is retained and has no knowledge of our Linux slots. Without the flag the initramfs is the
++//!      system (the emulator's dev boot);
+ //!   3. move the initramfs to header +0x28 (0: INITRD_AT) and the kernel to 0x60008000 (stored as raw deflate when
+ //!      header +0x30 gives its inflated length: copied just below this stub, inflated into place, the time printed),
+ //!      write ATAGs, jump (r0 = 0, r1 = machine, r2 = ATAGs, SVC, IRQs off, MMU and D-cache off as the preloader left
+@@ -26,7 +20,6 @@
+ use core::ptr::{copy, copy_nonoverlapping, read_volatile, write_volatile};
+ use dm870::timers::timers;
+ use zd1_boot::{say, say_hex, say_u32};
+-use zd1_link::spi::spec::{boot, reg};
+
+ zd1_boot::entry!(main);
+
+@@ -36,11 +29,7 @@
+ const ATAGS_AT: usize = 0x6000_0100;
+ const STUB_AT: usize = dm870::memory::BOOT_STUB as usize; // where the trampoline put us (linuxboot.ld)
+ const INITRD_AT: usize = 0x6180_0000; // default (header +0x28 = 0): below this stub, above the kernel's working set
+-const SLOTS: u32 = 1; // header +0x2C: ask the MCU for a system slot
+-const ANSWER_US: u32 = 5_000_000;
+-/// The slots' MTD partitions (module/os/os.toml mtdparts: mtd1 system-a, mtd2 system-b).
+-const ROOT_A: &[u8] = b" root=/dev/mtdblock1 rootfstype=jffs2 ro zd1.slot=a";
+-const ROOT_B: &[u8] = b" root=/dev/mtdblock2 rootfstype=jffs2 ro zd1.slot=b";
++const SLOTS: u32 = 1; // header +0x2C: local recovery entry before mounting a system slot
+
+ fn hdr(off: usize) -> u32 {
+     unsafe { read_volatile((HDR + off) as *const u32) }
+@@ -56,7 +45,7 @@
+ /// IRQs, loads TIF_NEED_RESCHED, ignores it and returns (arch_idle is empty). With that build's exact words in place
+ /// it becomes mainline's: `tst r3, #2; bleq cpu_arm926_do_idle` (WFI, which a masked IRQ ends), IRQs on again. The
+ /// emulator applies the same patch (emu/renode/cr870/CR870.cs, PatchLinuxIdle). Physical addresses (VA - 0x60000000).
+-fn idle_wfi(link: &mut zd1_link::Link<zd1_boot::Board>) {
++fn idle_wfi(link: &mut zd1_boot::Link<zd1_boot::Board>) {
+     const WORDS: [(usize, u32); 6] = [
+         (0x6002_75a8, 0xe10f_3000),
+         (0x6002_75ac, 0xe3c3_3080),
+@@ -139,15 +128,19 @@
+ }
+
+ fn main() -> ! {
++    dm870::arm_boot_recovery(&mut dm870::Physical);
+     unsafe {
+         // the I-cache (allowed with the MMU off): ~10x on code from SDRAM
+         core::arch::asm!("mov r0, #0", "mcr p15, 0, r0, c7, c5, 0", "mrc p15, 0, r0, c1, c0, 0",
+                          "orr r0, r0, #0x1000", "mcr p15, 0, r0, c1, c0, 0", out("r0") _);
+     }
+     let mut link = zd1_boot::link_up();
+-    link.set_value(reg::VERSION_IMAGE, b"zd1-boot\0");
+-    link.set_status(zd1_link::spi::spec::status::BOOTING);
+-    say(&mut link, "\n[linuxboot] zd1 Linux boot stub\n");
++    let bootlog = hdr(0) == MAGIC && hdr(0x2c) & 2 != 0;
++    if bootlog {
++        zd1_boot::bootlog::start(&mut link);
++    }
++    link.set_value(0x25, b"srs-x7-boot\0");
++    say(&mut link, "\n[linuxboot] SRS-X7 Linux boot stub\n");
+     if hdr(0) != MAGIC {
+         say(&mut link, "[linuxboot] bad header magic: serving the link (HCR 0x21 -> BL2)\n");
+         zd1_boot::serve_until_bl2(&mut link, "[linuxboot]");
+@@ -173,41 +166,15 @@
+         clen += 1;
+     }
+     let base = KERNEL_AT;
+-    let mut i_len = i_len;
+     if flags & SLOTS != 0 {
+-        let t0 = timers(link.mmio()).now();
+-        while link.reg(reg::BOOT) == 0 && timers(link.mmio()).us_since(t0) < ANSWER_US {
+-            link.poll();
+-        }
+-        let answer = link.reg(reg::BOOT);
+-        let (start, good) = ((answer >> 8) as u8, answer as u8);
+-        let mut add = |s: &[u8]| {
+-            for &b in s {
+-                if clen < cmdline.len() - 1 {
+-                    cmdline[clen] = b;
+-                    clen += 1;
+-                }
+-            }
+-        };
+-        add(if good == boot::SLOT_B { b" zd1.good=b" } else { b" zd1.good=a" });
+-        match start {
+-            boot::RESCUE => {
+-                say(&mut link, "[linuxboot] the rescue (the MCU's choice)\n");
+-                add(b" zd1.rescue");
+-            }
+-            boot::SLOT_B => {
+-                say(&mut link, "[linuxboot] slot B (the MCU's choice)\n");
+-                add(ROOT_B);
+-                i_len = 0;
+-            }
+-            boot::SLOT_A => {
+-                say(&mut link, "[linuxboot] slot A (the MCU's choice)\n");
+-                add(ROOT_A);
+-                i_len = 0;
+-            }
+-            _ => {
+-                say(&mut link, "[linuxboot] no answer from the MCU: the rescue\n");
+-                add(b" zd1.rescue");
++        // Sony's stock controller has no zd1 slot-selection protocol. Always
++        // enter the retained rescue, which will own local system selection;
++        // never accept an unrelated Sony register as an A/B choice.
++        say(&mut link, "[linuxboot] Sony: local recovery entry\n");
++        for &byte in b" zd1.rescue" {
++            if clen < cmdline.len() - 1 {
++                cmdline[clen] = byte;
++                clen += 1;
+             }
+         }
+     }
+@@ -288,6 +255,9 @@
+         tag(&[w]);
+     }
+     tag(&[0, 0]);
++    if bootlog {
++        zd1_boot::bootlog::handoff(&mut link);
++    }
+     unsafe {
+         core::arch::asm!(
+             "msr cpsr_c, #0xd3",                 // SVC, IRQ + FIQ off
+diff --git a/module/boot/src/bootlog.rs b/module/boot/src/bootlog.rs
+new file mode 100644
+--- /dev/null
++++ b/module/boot/src/bootlog.rs
+@@ -0,0 +1,104 @@
++//! Transmit-only breadcrumbs before the kernel owns the MAC. Both callers run with the D-cache off.
++use crate::{Board, Link};
++use core::ptr::{addr_of_mut, read_volatile, write_volatile};
++use dm870::Mmio;
++use dm870::clocks::{Gate, Gates, Pll, PllSetting, tgen};
++use dm870::gpio::{Level, Pin, gpio};
++use dm870::timers::timers;
++
++const MAC: u32 = 0xe001_7000;
++const NCR: u32 = MAC;
++const NCFGR: u32 = MAC + 0x04;
++const TSR: u32 = MAC + 0x14;
++const TBQP: u32 = MAC + 0x1c;
++const IDR: u32 = MAC + 0x2c;
++const USED: u32 = 1 << 31;
++const TX_ENABLE: u32 = 1 << 3;
++const TX_START: u32 = 1 << 9;
++
++// Pinned in the relocated stub's reserved SDRAM. Never lend Linux a pointer to its own working memory.
++#[repr(C, align(32))]
++struct Tx {
++    descriptor: [u32; 2],
++    frame: [u8; 96],
++}
++static mut TX: Tx = Tx { descriptor: [0; 2], frame: [0; 96] };
++
++fn drain() {
++    unsafe { core::arch::asm!("mcr p15, 0, {0}, c7, c10, 4", in(reg) 0u32, options(nostack)) };
++}
++
++fn send(link: &mut Link<Board>, message: &[u8]) {
++    let m = link.mmio();
++    let lo = m.r32(MAC + 0x98).to_le_bytes();
++    let hi = m.r32(MAC + 0x9c).to_le_bytes();
++    let mut source = [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1]];
++    if source == [0; 6] || source[0] & 1 != 0 {
++        source = [0x02, 0x5a, 0xd1, 0, 0, 1];
++    }
++    let mut frame = [0u8; 96];
++    frame[..6].fill(0xff);
++    frame[6..12].copy_from_slice(&source);
++    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
++    let udp_len = 8 + message.len() as u16;
++    frame[14] = 0x45;
++    frame[16..18].copy_from_slice(&(20 + udp_len).to_be_bytes());
++    frame[22] = 1;
++    frame[23] = 17;
++    frame[30..34].fill(0xff); // 0.0.0.0 -> 255.255.255.255, before address assignment
++    let mut sum: u32 = frame[14..34].as_chunks::<2>().0.iter().map(|&word| u16::from_be_bytes(word) as u32).sum();
++    while sum > 0xffff {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++    frame[24..26].copy_from_slice(&(!(sum as u16)).to_be_bytes());
++    frame[34..36].copy_from_slice(&6666u16.to_be_bytes());
++    frame[36..38].copy_from_slice(&6666u16.to_be_bytes());
++    frame[38..40].copy_from_slice(&udp_len.to_be_bytes());
++    frame[42..42 + message.len()].copy_from_slice(message); // optional IPv4 UDP checksum stays zero
++    let len = (42 + message.len()).max(60);
++    m.w32(NCR, 0);
++    m.w32(TSR, 0x3f);
++    unsafe {
++        let data = addr_of_mut!(TX.frame).cast::<u8>();
++        let desc = addr_of_mut!(TX.descriptor).cast::<u32>();
++        core::ptr::copy_nonoverlapping(frame.as_ptr(), data, len);
++        write_volatile(desc, data as u32);
++        write_volatile(desc.add(1), (1 << 30) | (1 << 15) | len as u32); // wrap, last, length
++        drain();
++        m.w32(TBQP, desc as u32);
++        m.w32(NCR, TX_ENABLE);
++        m.w32(NCR, TX_ENABLE | TX_START);
++        let start = timers(m).now();
++        while timers(m).us_since(start) < 10_000 {
++            if read_volatile(desc.add(1)) & USED != 0 && m.r32(TSR) & 0x20 != 0 {
++                break;
++            }
++        }
++    }
++    m.w32(NCR, 0);
++    m.w32(TBQP, 0);
++}
++
++pub fn start(link: &mut Link<Board>) {
++    let m = link.mmio();
++    tgen(m).enable(Gates::of(&[Gate::ETHERNET]));
++    if tgen(m).pll(Pll::AV1) != PllSetting::AV1_PHY {
++        tgen(m).program(Pll::AV1, PllSetting::AV1_PHY);
++    }
++    gpio(m).drive(Pin::NresetEth, Level::High);
++    m.w32(NCR, 0);
++    m.w32(IDR, 0x3fff);
++    // Fixed 100 Mb/s, full duplex for the diagnostic transmission. PHY negotiation is not observed here.
++    m.w32(NCFGR, 0x803);
++    let start = timers(m).now();
++    for deadline in [0, 250_000, 750_000, 1_500_000, 2_500_000] {
++        while timers(link.mmio()).us_since(start) < deadline {
++            link.poll();
++        }
++        send(link, b"X7BOOT1 STUB\n");
++    }
++}
++
++pub fn handoff(link: &mut Link<Board>) {
++    send(link, b"X7BOOT1 HANDOFF\n");
++}
+diff --git a/module/boot/src/lib.rs b/module/boot/src/lib.rs
+--- a/module/boot/src/lib.rs
++++ b/module/boot/src/lib.rs
+@@ -4,11 +4,13 @@
+
+ use core::panic::PanicInfo;
+ use dm870::clocks::{Gates, tgen};
+-use dm870::pads::{self, pads};
++use dm870::pads::pads;
+ use dm870::timers::timers;
+ use dm870::uart::{UART1, uart};
+
+-pub use zd1_link::Link;
++pub mod bootlog;
++mod sony;
++pub use sony::Link;
+
+ /// `_start`: stack, zero .bss, then `rust_main` (the binary's `main`, see [`entry!`]). The linker scripts put
+ /// .text.boot first and define _stack_top, _bss_start, _bss_end.
+@@ -45,7 +47,7 @@
+     let mut board = Board;
+     timers(&mut board).start_timestamp();
+     uart(&mut board, UART1).set_baud(115_200);
+-    pads(&mut board).route(&pads::BL2);
++    pads(&mut board).route(&x7_transport::SONY_PADS);
+     tgen(&mut board).enable(Gates::SPI_SLAVE);
+     Link::new(board)
+ }
+@@ -86,6 +88,7 @@
+
+ /// Stay reachable: serve the link until the MCU asks for BL2 (HCR 0x21), then reboot into it.
+ pub fn serve_until_bl2(link: &mut Link<Board>, who: &str) -> ! {
++    link.set_status(0x2000);
+     loop {
+         link.poll();
+         if link.bl2_requested() {
+diff --git a/module/boot/src/sony.rs b/module/boot/src/sony.rs
+new file mode 100644
+--- /dev/null
++++ b/module/boot/src/sony.rs
+@@ -0,0 +1,67 @@
++//! The same Sony endpoint used by Linux, polled before the kernel starts.
++//! This stage keeps the controller's startup handshake pending and preserves HCR recovery access. The
++//! Sony controller does not select our Linux system slots.
++use dm870::{
++    Mmio,
++    gpio::{Level, gpio},
++    timers::timers,
++};
++use x7_protocol::Kind;
++use x7_registers::Registers;
++use x7_transport::{READY, REQUEST, Transport};
++
++pub struct Link<M: Mmio> {
++    transport: Transport<M>,
++    registers: Registers,
++}
++
++impl<M: Mmio> Link<M> {
++    pub fn new(bus: M) -> Self {
++        let mut registers = Registers::new();
++        registers.set_fixed(0x28, [0, 0]);
++        registers.set_fixed(0x29, [0x20, 0x20]);
++        Self { transport: Transport::new(bus), registers }
++    }
++
++    pub fn mmio(&mut self) -> &mut M {
++        self.transport.bus()
++    }
++
++    pub fn set_value(&mut self, register: u8, value: &[u8]) {
++        // Boot identities are always <=20 bytes; no allocation or truncation.
++        if self.registers.set_variable(register, value).is_ok() {
++            let _ = self.registers.notify(Kind::ReadVariable, register, value);
++        }
++    }
++
++    pub fn set_status(&mut self, status: u16) {
++        let value = status.to_be_bytes();
++        self.registers.set_fixed(0x11, value);
++        let _ = self.registers.notify(Kind::ReadFixed, 0x11, &value);
++    }
++
++    pub fn poll(&mut self) {
++        self.transport.service(&mut self.registers);
++        while self.registers.pop_write().is_some() {}
++    }
++
++    pub fn bl2_requested(&self) -> bool {
++        self.registers.fixed(0x28).is_some_and(|bytes| bytes[0] == 0x21)
++    }
++
++    pub fn release_request_line(&mut self) {
++        self.transport.abort();
++        gpio(self.mmio()).drive(REQUEST, Level::Low);
++        gpio(self.mmio()).drive(READY, Level::Low);
++    }
++
++    pub fn reboot_to_bl2(&mut self) -> ! {
++        self.registers.set_fixed(0x29, [0x20, 0x20]);
++        let _ = self.registers.notify(Kind::ReadFixed, 0x29, &[0x20, 0x20]);
++        let start = timers(self.mmio()).now();
++        while timers(self.mmio()).us_since(start) < 500_000 {
++            self.poll();
++        }
++        dm870::reset_into_bl2(self.mmio())
++    }
++}
+diff --git a/module/dm870/src/clocks.rs b/module/dm870/src/clocks.rs
+--- a/module/dm870/src/clocks.rs
++++ b/module/dm870/src/clocks.rs
+@@ -114,8 +114,9 @@
+     /// the driver has loaded (BL2's value), the core runs but hears nothing until the driver is reloaded [HW
+     /// 2026-10-24].
+     pub const WILD_HOLD: u32 = 1 << 15;
+-    /// The stock app sets it; what it does is unknown.
+-    pub const STOCK: u32 = 1 << 21;
++    /// The Sony player selects source 2 in the Ethernet PHY clock mux (TGEN.MISC bits 23:20).
++    pub const ETH_PHY_SELECT: u32 = 0xf << 20;
++    pub const STOCK: u32 = 2 << 20;
+ }
+
+ /// Registers the stock app writes whose purpose is unknown, with its values. Nothing has been seen to need them; they
+diff --git a/module/dm870/src/lib.rs b/module/dm870/src/lib.rs
+--- a/module/dm870/src/lib.rs
++++ b/module/dm870/src/lib.rs
+@@ -77,3 +77,17 @@
+     mailbox::request_bl2(m);
+     timers::timers(m).reset_now()
+ }
++
++/// Keep a warm-reset route to the vendor updater until Linux management starts.
++pub fn arm_boot_recovery(m: &mut impl Mmio) {
++    mailbox::request_bl2(m);
++    timers::timers(m).arm_boot_watchdog();
++}
++
++pub fn complete_boot_recovery(m: &mut impl Mmio) -> bool {
++    if mailbox::bl2_requested(m) && timers::timers(m).disarm_boot_watchdog() {
++        m.w32(mailbox::BASE, 0);
++        return true;
++    }
++    false
++}
+diff --git a/module/dm870/src/mailbox.rs b/module/dm870/src/mailbox.rs
+--- a/module/dm870/src/mailbox.rs
++++ b/module/dm870/src/mailbox.rs
+@@ -10,7 +10,11 @@
+
+ /// Leave the request; the next reset starts BL2.
+ pub fn request_bl2(m: &mut (impl Mmio + ?Sized)) {
+-    m.w32(BASE, MAGIC);
+     m.w32(BASE + 4, MODE_BL2);
+     m.w32(BASE + 8, !MAGIC);
++    m.w32(BASE, MAGIC);
+ }
++
++pub fn bl2_requested(m: &mut impl Mmio) -> bool {
++    m.r32(BASE) == MAGIC && m.r32(BASE + 4) == MODE_BL2 && m.r32(BASE + 8) == !MAGIC
++}
+diff --git a/module/dm870/src/timers.rs b/module/dm870/src/timers.rs
+--- a/module/dm870/src/timers.rs
++++ b/module/dm870/src/timers.rs
+@@ -34,6 +34,11 @@
+ /// sizes its delays as clock × us / 1e6.
+ pub const TICKS_PER_US: u32 = 80;
+
++// Allow two minutes at the 80 MHz timer clock divided by 16. The boot
++// watchdog uses timer 0 only. Linux uses timer 2 and the timestamp.
++const BOOT_THRESHOLD: u32 = 120 * 1_000_000 * (TICKS_PER_US / 16);
++const BOOT_MODE: u32 = RESET_ON_EXPIRY | divided(0) | running(0);
++
+ pub struct Timers<'a, M: Mmio + ?Sized>(&'a mut M);
+
+ pub fn timers<M: Mmio + ?Sized>(m: &mut M) -> Timers<'_, M> {
+@@ -62,6 +67,22 @@
+         self.0.r32(BASE + RUN)
+     }
+
++    pub fn arm_boot_watchdog(&mut self) {
++        self.0.w32(BASE + STOP, BOOT_MODE | one_shot(0));
++        self.0.w32(BASE + THRESHOLD, BOOT_THRESHOLD);
++        self.0.w32(BASE + COUNT, 0);
++        self.0.w32(BASE + RUN, BOOT_MODE);
++    }
++
++    /// A web-service restart must leave another owner's watchdog alone.
++    pub fn disarm_boot_watchdog(&mut self) -> bool {
++        if self.config() & BOOT_MODE != BOOT_MODE || self.0.r32(BASE + THRESHOLD) != BOOT_THRESHOLD {
++            return false;
++        }
++        self.0.w32(BASE + STOP, BOOT_MODE);
++        true
++    }
++
+     /// Restart the chip now: timer 0 as a watchdog that expires at once (the stock app's sequence; the threshold is
+     /// what it clamps to).
+     pub fn reset_now(&mut self) -> ! {
+diff --git a/module/os/apps/zd1-airplay/src/lib.rs b/module/os/apps/zd1-airplay/src/lib.rs
+--- a/module/os/apps/zd1-airplay/src/lib.rs
++++ b/module/os/apps/zd1-airplay/src/lib.rs
+@@ -174,10 +174,10 @@
+     let release = zd1_sys::OsRelease::read("/etc/os-release");
+     let version = release.get("VERSION_ID");
+     DeviceIdentity {
+-        model: "Zeppelin Air".into(),
+-        manufacturer: Some("Bowers & Wilkins".into()),
++        model: "SRS-X7".into(),
++        manufacturer: Some("Sony Corporation".into()),
+         serial_number: Some(mac.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join("-")),
+-        firmware_version: format!("zd1-os {version}"),
++        firmware_version: format!("srs-x7 {version}"),
+         os_version: None,
+     }
+ }
+diff --git a/module/os/apps/zd1-audio/Cargo.toml b/module/os/apps/zd1-audio/Cargo.toml
+--- a/module/os/apps/zd1-audio/Cargo.toml
++++ b/module/os/apps/zd1-audio/Cargo.toml
+@@ -7,6 +7,7 @@
+
+ [dependencies]
+ alsa = "0.9"
++dm870 = { workspace = true, features = ["linux"] }
+ nix = { version = "0.29", default-features = false, features = ["time"] }
+ tracing = "0.1"
+ # tracing-log: librespot logs through `log`
+diff --git a/module/os/apps/zd1-audio/src/device.rs b/module/os/apps/zd1-audio/src/device.rs
+--- a/module/os/apps/zd1-audio/src/device.rs
++++ b/module/os/apps/zd1-audio/src/device.rs
+@@ -2,6 +2,7 @@
+ //! 256-frame periods, the driver's only size. `Device` counts the frames it was given, its stream's clock, and
+ //! measures when they play (`Playout`); the output (zd1-airplay, zd1-spotify) and zd1-snapcast's player write through it.
+
++use crate::{sony_output::SonyOutput, speaker::Speaker};
+ use alsa::pcm::{Access, Format, HwParams, PCM, State};
+ use alsa::{Direction, ValueOr};
+ use std::collections::VecDeque;
+@@ -58,6 +59,8 @@
+ }
+
+ pub struct Device {
++    // Remute before ALSA releases the exclusive line-out device.
++    sony: Option<SonyOutput>,
+     pub pcm: PCM,
+     pub rate: u32,
+     /// Every frame the device was given, silence included: its stream's clock.
+@@ -71,7 +74,24 @@
+     /// two periods past ours, not an empty buffer (ALSA's default): the output's faded flush (`reset`, then the fade
+     /// written) was an xrun every time with the default, and with one frame past it still when the driver's period
+     /// interrupt fell between the two.
+-    pub fn open(name: &str, rate: u32, periods: usize, late_underrun: bool) -> Result<Device, alsa::Error> {
++    pub fn open(
++        name: &str,
++        rate: u32,
++        periods: usize,
++        late_underrun: bool,
++        speaker: &Speaker,
++    ) -> Result<Device, alsa::Error> {
++        Self::open_while(name, rate, periods, late_underrun, speaker, &|| true)
++    }
++
++    fn open_while(
++        name: &str,
++        rate: u32,
++        periods: usize,
++        late_underrun: bool,
++        speaker: &Speaker,
++        current: &dyn Fn() -> bool,
++    ) -> Result<Device, alsa::Error> {
+         let pcm = PCM::new(name, Direction::Playback, false)?;
+         let buffer = {
+             let hw = HwParams::any(&pcm)?;
+@@ -101,14 +121,22 @@
+         };
+         pcm.prepare()?;
+         pcm.io_i32()?; // the format the writes take
+-        Ok(Device { pcm, rate, frames: 0, playout: Playout::default(), full: buffer as i64 - 2 * PERIOD as i64 })
++        let sony = SonyOutput::open(&pcm, speaker, current)?;
++        Ok(Device { sony, pcm, rate, frames: 0, playout: Playout::default(), full: buffer as i64 - 2 * PERIOD as i64 })
+     }
+
+     /// As `open`, retried for up to 3 s: the source letting go of the device may still hold it.
+-    pub fn open_retry(name: &str, rate: u32, periods: usize, late_underrun: bool) -> Option<Device> {
++    pub fn open_retry(
++        name: &str,
++        rate: u32,
++        periods: usize,
++        late_underrun: bool,
++        speaker: &Speaker,
++        current: &dyn Fn() -> bool,
++    ) -> Option<Device> {
+         let t = Instant::now();
+-        loop {
+-            match Device::open(name, rate, periods, late_underrun) {
++        while current() {
++            match Device::open_while(name, rate, periods, late_underrun, speaker, current) {
+                 Ok(d) => return Some(d),
+                 Err(e) if t.elapsed() > Duration::from_secs(3) => {
+                     tracing::warn!(name, %e, "can't open the output");
+@@ -117,6 +145,7 @@
+                 Err(_) => std::thread::sleep(Duration::from_millis(100)),
+             }
+         }
++        None
+     }
+
+     /// ALSA's delay in frames while the device runs (None while it is prepared, not started).
+@@ -133,12 +162,19 @@
+     /// Interleaved stereo frames to the device (blocks while its buffer is full): Some(frames written), or None for
+     /// an xrun it recovered from (the stream's timing starts over); Err: it didn't recover (open it again).
+     pub fn write(&mut self, buf: &[i32]) -> Result<Option<usize>, alsa::Error> {
++        if let Some(route) = &mut self.sony {
++            route.check()?;
++        }
+         match self.pcm.io_i32()?.writei(buf) {
+             Ok(n) => {
+                 self.frames += n as u64;
+                 Ok(Some(n))
+             }
+             Err(e) => {
++                if self.sony.is_some() {
++                    // The next open re-establishes framing and the muted clock lead-in.
++                    return Err(e);
++                }
+                 tracing::debug!(%e, "ALSA xrun");
+                 self.playout.reset();
+                 self.pcm.try_recover(e, true)?;
+diff --git a/module/os/apps/zd1-audio/src/lib.rs b/module/os/apps/zd1-audio/src/lib.rs
+--- a/module/os/apps/zd1-audio/src/lib.rs
++++ b/module/os/apps/zd1-audio/src/lib.rs
+@@ -8,6 +8,7 @@
+ pub mod device;
+ pub mod output;
+ mod queue;
++mod sony_output;
+ pub mod speaker;
+
+ pub use app::Args;
+diff --git a/module/os/apps/zd1-audio/src/output.rs b/module/os/apps/zd1-audio/src/output.rs
+--- a/module/os/apps/zd1-audio/src/output.rs
++++ b/module/os/apps/zd1-audio/src/output.rs
+@@ -21,6 +21,7 @@
+
+ use super::device::{Device, PERIOD, frames_ns, mono_ns};
+ use super::queue::{Queue, Sample};
++use super::sony_output;
+ use super::speaker::Speaker;
+ use std::collections::VecDeque;
+ use std::sync::{Arc, Condvar, Mutex};
+@@ -339,35 +340,48 @@
+         let mut s = lock.lock().unwrap();
+         s.tap.report();
+         s.active = false;
+-        s.queue.clear();
++        // The next stream chooses a new queue width. Release this stream's buffers while idle.
++        s.queue = Queue::new(16);
++        s.marks = VecDeque::new();
+         cvar.notify_all();
+     }
+
+     fn run(&self, device: String, speaker: Speaker) {
++        let sony = device == "hw:0,0" && sony_output::is_sony();
++        let mut attempted = None;
+         loop {
+-            let (rate, channels, flushes) = self.wait_prebuffer(&speaker);
++            let (stream, rate, channels, flushes) = self.wait_to_open(&speaker, sony, attempted);
++            attempted = Some(stream);
++            let current = || {
++                let s = self.inner.0.lock().unwrap();
++                s.active && s.stream == stream.0 && !speaker.yielded() && (!sony || s.last_push.elapsed() <= IDLE)
++            };
+             speaker.state("playing");
+             if device == "null" {
+                 self.run_null(rate, channels, &speaker);
+-            } else if let Some(mut p) = Playback::open(&device, rate, channels, flushes) {
++            } else if let Some(mut p) = Playback::open(&device, rate, channels, flushes, &speaker, &current) {
+                 while p.step(self, &speaker) {}
+                 p.close(self);
+             } else {
+-                self.inner.0.lock().unwrap().queue.clear();
++                self.flush(stream);
+             }
+             speaker.state("stopped");
+         }
+     }
+
+-    /// A stream with a prebuffer's worth of audio, while no other source has the speaker: its rate, channels and
+-    /// flush count.
+-    fn wait_prebuffer(&self, speaker: &Speaker) -> (u32, u8, u64) {
++    /// Sony can warm up its muted output as soon as the decoder knows the stream format.
++    /// If that attempt fails, wait for the normal PCM prebuffer before trying again.
++    fn wait_to_open(&self, speaker: &Speaker, sony: bool, attempted: Option<Stream>) -> (Stream, u32, u8, u64) {
+         let (lock, cvar) = &*self.inner;
+         let mut s = lock.lock().unwrap();
+         loop {
++            let stream = Stream(s.stream);
+             let need = PREBUFFER_MS * s.rate as usize / 1000 * s.channels as usize;
+-            if s.active && s.queue.len() >= need && !speaker.yielded() {
+-                return (s.rate, s.channels, s.flushes);
++            let early = sony && attempted != Some(stream);
++            let ready = !speaker.yielded() && (!sony || (speaker.audio_on() && s.last_push.elapsed() <= IDLE));
++            if s.active && ready && (early || s.queue.len() >= need) {
++                tracing::info!(rate = s.rate, queued_ms = s.frames() * 1000 / s.rate as usize, "preparing output");
++                return (stream, s.rate, s.channels, s.flushes);
+             }
+             s = cvar.wait_timeout(s, Duration::from_millis(200)).unwrap().0;
+         }
+@@ -441,6 +455,7 @@
+     steer: Steer,
+     fade_in: bool, // the next audio written follows silence (or a cut: a flush)
+     audible: bool, // audio went to the device since the last flush's fade
++    startup_skipped: u64,
+     // what the device was given last, as much as its buffer holds: to fade out what a flush drops
+     recent: VecDeque<i32>,
+     xruns: u32,
+@@ -452,8 +467,15 @@
+ }
+
+ impl Playback {
+-    fn open(device: &str, rate: u32, channels: u8, flushes: u64) -> Option<Playback> {
+-        let dev = Device::open_retry(device, rate, PERIODS, true)?;
++    fn open(
++        device: &str,
++        rate: u32,
++        channels: u8,
++        flushes: u64,
++        speaker: &Speaker,
++        current: &dyn Fn() -> bool,
++    ) -> Option<Playback> {
++        let dev = Device::open_retry(device, rate, PERIODS, true, speaker, current)?;
+         tracing::info!(device, rate, channels, "output open");
+         let offset_us =
+             std::env::var("ZD1_OUTPUT_DELAY_US").ok().and_then(|v| v.parse().ok()).unwrap_or(OUTPUT_OFFSET_US);
+@@ -474,6 +496,7 @@
+             },
+             fade_in: true,
+             audible: false,
++            startup_skipped: 0,
+             recent: VecDeque::with_capacity(PERIOD * PERIODS * 2),
+             xruns: 0,
+             written: 0,
+@@ -488,6 +511,7 @@
+     fn step(&mut self, out: &Output, speaker: &Speaker) -> bool {
+         let (lock, cvar) = &*out.inner;
+         let (mut delay, now) = (self.dev.delay(), mono_ns());
++        let first = self.written == 0;
+         let (frames, starved) = {
+             let mut s = lock.lock().unwrap();
+             let idle = s.last_push.elapsed() > IDLE;
+@@ -504,17 +528,32 @@
+                     delay = None; // read before the device's queue changed
+                 }
+             }
+-            let (lead_silence, slip) = self.steer(&mut s, now, delay);
++            let before = s.taken;
++            let (mut lead_silence, slip) = self.steer(&mut s, now, delay);
++            if first {
++                self.startup_skipped += s.taken - before;
++            }
++            // An early open may finish before untimed audio has filled its normal prebuffer.
++            if first && !self.timed && s.frames() < PREBUFFER_MS * s.rate as usize / 1000 {
++                lead_silence = CHUNK;
++            }
+             self.interval.low = self.interval.low.min(s.frames());
+-            let r = self.fill(&mut s, lead_silence, slip);
++            let result = self.fill(&mut s, lead_silence, slip);
+             cvar.notify_all(); // room for a paced producer (push_paced)
+-            r
++            result
+         };
+         if self.interval.since.elapsed() >= Duration::from_secs(10) {
+             self.report(lock.lock().unwrap().dropped);
+         }
+         match self.dev.write(&self.buf[..frames * 2]) {
+             Ok(Some(n)) => {
++                if first && self.written != 0 {
++                    tracing::info!(
++                        alsa_delay_frames = ?delay,
++                        skipped_frames = self.startup_skipped,
++                        "first audio submitted"
++                    );
++                }
+                 self.recent.extend(&self.buf[..n * 2]);
+                 let over = self.recent.len().saturating_sub(PERIOD * PERIODS * 2);
+                 self.recent.drain(..over);
+diff --git a/module/os/apps/zd1-audio/src/sony_output.rs b/module/os/apps/zd1-audio/src/sony_output.rs
+new file mode 100644
+--- /dev/null
++++ b/module/os/apps/zd1-audio/src/sony_output.rs
+@@ -0,0 +1,159 @@
++//! Sony's AV2 line-out framing and the two output mutes. The receiver holds
++//! the ALSA device exclusively for the lifetime of this guard.
++use crate::{device::PERIOD, speaker::Speaker};
++use alsa::pcm::{PCM, State};
++use dm870::{DevMem, Mmio, gpio};
++use std::time::{Duration, Instant};
++
++const KIND: u32 = 0xe000_a008;
++const SYNC: u32 = 0xe000_a808;
++const DATA: u32 = 1 << 8;
++const CLOCK: u32 = 1 << 10;
++const SELECT: u32 = 1 << 11;
++const MUTE: u32 = 1 << 16;
++const PINS: u32 = DATA | CLOCK | SELECT | MUTE;
++
++pub(super) struct SonyOutput {
++    bus: DevMem,
++    speaker: Speaker,
++    direction: u32,
++    latch: u32,
++    old_framing: Option<u32>,
++}
++
++fn error(reason: &'static str) -> alsa::Error {
++    alsa::Error::new(reason, nix::libc::EIO)
++}
++
++pub(super) fn is_sony() -> bool {
++    zd1_sys::OsRelease::read("/usr/lib/os-release").get("ID") == "sony-x7"
++}
++
++impl SonyOutput {
++    pub fn open(pcm: &PCM, speaker: &Speaker, current: &dyn Fn() -> bool) -> Result<Option<Self>, alsa::Error> {
++        if !is_sony() {
++            return Ok(None);
++        }
++        let info = pcm.info()?;
++        if info.get_card() != 0 || info.get_device() != 0 {
++            return Ok(None);
++        }
++        if speaker.yielded() || !speaker.audio_on() {
++            return Err(error("Sony source grant pending"));
++        }
++        let mut bus = DevMem::open().map_err(|_| error("open Sony audio registers"))?;
++        bus.read32(KIND).map_err(|_| error("map Sony AV2"))?;
++        let direction = bus.r32(gpio::BASE + gpio::reg::RELEASE);
++        let latch = bus.r32(gpio::BASE + gpio::reg::LOW);
++        let mut out = Self { bus, speaker: speaker.clone(), direction, latch, old_framing: None };
++        out.pins(gpio::reg::HIGH, MUTE | SELECT | CLOCK);
++        out.pins(gpio::reg::DRIVE, PINS);
++        out.control(0x2c)?;
++        let silence = [0i32; PERIOD * 2];
++        let io = pcm.io_i32()?;
++        let deadline = Instant::now() + Duration::from_secs(5);
++        let mut clock_started = None;
++        loop {
++            if !current() || !out.granted() || Instant::now() >= deadline {
++                return Err(error("Sony stream ended, source revoked or AV2 clock unavailable"));
++            }
++            io.writei(&silence)?;
++            if pcm.state() != State::Running {
++                continue;
++            }
++            let kind = out.bus.r32(KIND);
++            match (out.old_framing, kind & 0x3ff) {
++                (None, 0x19 | 0x29) => {
++                    out.old_framing = Some(kind & 0x30);
++                    out.bus.w32(KIND, (kind & !0x30) | 0x10);
++                }
++                (Some(_), 0x19) => {}
++                _ => return Err(error("unexpected Sony AV2 format")),
++            }
++            if out.bus.r32(SYNC) & 1 == 0 {
++                clock_started = None;
++                continue;
++            }
++            if clock_started.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(2) {
++                break;
++            }
++        }
++        if !current() || !out.granted() || out.bus.r32(KIND) & 0x3ff != 0x19 {
++            return Err(error("Sony stream, grant or framing changed during clock lead-in"));
++        }
++        out.control(0x2d)?;
++        out.pins(gpio::reg::LOW, MUTE);
++        out.check()?;
++        tracing::info!("Sony AV2 synchronized, GPIO16 low, HWCom 0x2d");
++        Ok(Some(out))
++    }
++
++    fn granted(&self) -> bool {
++        self.speaker.audio_on() && !self.speaker.yielded()
++    }
++
++    pub fn check(&mut self) -> Result<(), alsa::Error> {
++        if self.granted()
++            && self.bus.r32(KIND) & 0x3ff == 0x19
++            && self.bus.r32(SYNC) & 1 != 0
++            && self.bus.r32(gpio::BASE + gpio::reg::HIGH) & MUTE == 0
++        {
++            Ok(())
++        } else {
++            self.pins(gpio::reg::HIGH, MUTE);
++            Err(error("Sony output lost grant, framing, sync or unmute"))
++        }
++    }
++
++    fn pins(&mut self, register: u32, mask: u32) {
++        self.bus.w32(gpio::BASE + register, mask);
++    }
++
++    fn control(&mut self, byte: u8) -> Result<(), alsa::Error> {
++        // KnOS 0x60327414, active-low select and MSB first. Hold the edge
++        // without a scheduler tick per bit on this 100 Hz kernel.
++        let delay = || {
++            let start = Instant::now();
++            while start.elapsed() < Duration::from_millis(1) {
++                std::hint::spin_loop();
++            }
++        };
++        self.pins(gpio::reg::LOW, SELECT);
++        delay();
++        let mut wire = 0;
++        for bit in (0..8).rev() {
++            self.pins(gpio::reg::LOW, CLOCK);
++            self.pins(if byte & (1 << bit) == 0 { gpio::reg::LOW } else { gpio::reg::HIGH }, DATA);
++            delay();
++            self.pins(gpio::reg::HIGH, CLOCK);
++            delay();
++            let pads = self.bus.r32(gpio::BASE + gpio::reg::HIGH);
++            if pads & (CLOCK | SELECT) != CLOCK {
++                return Err(error("Sony HWCom clock/select"));
++            }
++            wire = (wire << 1) | u8::from(pads & DATA != 0);
++        }
++        self.pins(gpio::reg::HIGH, SELECT);
++        if wire != byte {
++            return Err(error("Sony HWCom data"));
++        }
++        Ok(())
++    }
++}
++
++impl Drop for SonyOutput {
++    fn drop(&mut self) {
++        self.pins(gpio::reg::HIGH, MUTE);
++        if let Err(err) = self.control(0x2c) {
++            tracing::warn!(%err, "Sony hardware mute");
++        }
++        if let Some(old) = self.old_framing {
++            let kind = self.bus.r32(KIND);
++            self.bus.w32(KIND, (kind & !0x30) | old);
++        }
++        self.pins(gpio::reg::RELEASE, self.direction & PINS);
++        self.pins(gpio::reg::HIGH, self.latch & PINS);
++        self.pins(gpio::reg::LOW, !self.latch & PINS);
++        self.pins(gpio::reg::DRIVE, !self.direction & PINS);
++    }
++}
+diff --git a/module/os/apps/zd1-audio/src/speaker.rs b/module/os/apps/zd1-audio/src/speaker.rs
+--- a/module/os/apps/zd1-audio/src/speaker.rs
++++ b/module/os/apps/zd1-audio/src/speaker.rs
+@@ -55,10 +55,10 @@
+                 session: false,
+                 volume: None,
+                 level: None,
+-                audio: None,
++                audio: Some(false),
+             })),
+             source,
+-            yielded: Arc::new(AtomicBool::new(false)),
++            yielded: Arc::new(AtomicBool::new(true)),
+         };
+         let s2 = sp.clone();
+         std::thread::spawn(move || s2.run(events));
+@@ -70,9 +70,9 @@
+         self.yielded.load(Ordering::Relaxed)
+     }
+
+-    /// The speaker has the module as its input (`audio on`, or not told otherwise yet).
++    /// The controller has confirmed the module as its input (`audio on`).
+     pub fn audio_on(&self) -> bool {
+-        self.link.lock().unwrap().audio != Some(false)
++        self.link.lock().unwrap().audio == Some(true)
+     }
+
+     /// The speaker's volume (0-100) as far as we know it: what zd1-linkd last said, or our last `volume`.
+@@ -113,6 +113,33 @@
+     pub fn intent(&self) {
+         tracing::info!("picked: telling the speaker");
+         write_line(&mut self.link.lock().unwrap().stream, &format!("intent {}", self.source));
++    }
++
++    /// A local file can start before the receiver thread has even connected.
++    /// Wait for the socket, send one intent, and wait for this source's grant.
++    pub fn request_local_output(&self, device: &str, timeout: Duration) -> bool {
++        if device == "null" || zd1_sys::OsRelease::read("/usr/lib/os-release").get("ID") != "sony-x7" {
++            return true;
++        }
++        self.session(true);
++        let deadline = std::time::Instant::now() + timeout;
++        let mut requested = false;
++        while std::time::Instant::now() < deadline {
++            {
++                let mut link = self.link.lock().unwrap();
++                if link.stream.is_none() {
++                    requested = false;
++                } else if !requested {
++                    write_line(&mut link.stream, &format!("intent {}", self.source));
++                    requested = link.stream.is_some();
++                }
++                if requested && link.audio == Some(true) && !self.yielded() {
++                    return true;
++                }
++            }
++            std::thread::sleep(Duration::from_millis(20));
++        }
++        false
+     }
+
+     fn run(&self, events: impl Fn(Event)) {
+@@ -139,6 +166,13 @@
+                 let Ok(line) = line else { break };
+                 let (cmd, arg) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+                 match (cmd, arg) {
++                    ("grant", source) if source == self.source => {
++                        self.yielded.store(false, Ordering::Relaxed);
++                        self.reclaim();
++                    }
++                    ("grant", _) => {
++                        self.yielded.store(true, Ordering::Relaxed);
++                    }
+                     ("key", k) => {
+                         // `key KEY [SOURCE]`: for the source in front, or everyone
+                         let (key, to) = k.split_once(' ').unwrap_or((k, self.source));
+@@ -187,7 +221,14 @@
+                     _ => {}
+                 }
+             }
+-            self.link.lock().unwrap().stream = None;
++            self.yielded.store(true, Ordering::Relaxed);
++            let playing = {
++                let mut link = self.link.lock().unwrap();
++                link.stream = None;
++                link.audio = Some(false);
++                link.state == "playing"
++            };
++            events(Event::Release { playing });
+             std::thread::sleep(Duration::from_secs(1));
+         }
+     }
+diff --git a/module/os/apps/zd1-board/Cargo.toml b/module/os/apps/zd1-board/Cargo.toml
+--- a/module/os/apps/zd1-board/Cargo.toml
++++ b/module/os/apps/zd1-board/Cargo.toml
+@@ -7,3 +7,4 @@
+
+ [dependencies]
+ dm870 = { workspace = true, features = ["linux"] }
++x7-transport = { path = "../../../../x7/transport" }
+diff --git a/module/os/apps/zd1-board/src/lib.rs b/module/os/apps/zd1-board/src/lib.rs
+--- a/module/os/apps/zd1-board/src/lib.rs
++++ b/module/os/apps/zd1-board/src/lib.rs
+@@ -5,21 +5,34 @@
+ use dm870::Mmio;
+ use dm870::clocks::{Gate, Gates, Pll, PllSetting, Reset, misc, tgen};
+ use dm870::gpio::{Level, Mode, Pin, gpio};
+-use dm870::pads::{self, Mtx, pads};
++use dm870::pads::{Mtx, pads};
+ use dm870::timers::{self, timers};
+ use std::fmt::Write;
++use std::time::Duration;
++use x7_transport::SONY_PADS;
+
+ /// Bring the board up: the pad routing, the Ethernet PHY out of reset and its clock (AV1), the clock gates the stock
+ /// app has on and the SPI slave's. Run once, after the kernel's modules are loaded: the values the drivers own (the
+ /// Wi-Fi core's reset and hold bit) are left as they are.
+ pub fn up(m: &mut impl Mmio) {
+-    pads(m).route(&pads::BL2);
+-    gpio(m).drive(Pin::NresetEth, Level::High);
++    pads(m).route(&SONY_PADS);
++    let clock_configured = tgen(m).pll(Pll::AV1) == PllSetting::AV1_PHY;
++    let clock_selected = tgen(m).misc() & misc::ETH_PHY_SELECT == misc::STOCK;
++    let needs_phy_reset =
++        !clock_configured || !clock_selected || gpio(m).mode(Pin::NresetEth) != Mode::Drives(Level::High);
+     let mut t = tgen(m);
+     t.enable(Gates::STOCK_APP.and(Gates::SPI_SLAVE));
+     t.set_misc_stock();
+     t.write_stock_unknown();
+-    t.program(Pll::AV1, PllSetting::AV1_PHY);
++    if !clock_configured {
++        t.program(Pll::AV1, PllSetting::AV1_PHY);
++    }
++    if needs_phy_reset {
++        // Sony's HWCom initialization pulses GPIO 12 after the clock is available.
++        gpio(m).drive(Pin::NresetEth, Level::Low);
++        std::thread::sleep(Duration::from_millis(10));
++        gpio(m).drive(Pin::NresetEth, Level::High);
++    }
+ }
+
+ /// The chip's state as text, a section per block: what `zd1-board show` prints.
+@@ -70,15 +83,15 @@
+         );
+     }
+
+-    if pads(m).holds(&pads::BL2) {
+-        let _ = writeln!(o, "pads     BL2's routing in all {} copies", pads::COPIES);
++    if pads(m).holds(&SONY_PADS) {
++        let _ = writeln!(o, "pads     captured Sony routing in all {} copies", dm870::pads::COPIES);
+     } else {
+-        let _ = writeln!(o, "pads     NOT BL2's routing:");
+-        for copy in 0..pads::COPIES {
+-            for &(reg, want) in pads::BL2.0 {
++        let _ = writeln!(o, "pads     differs from captured Sony routing:");
++        for copy in 0..dm870::pads::COPIES {
++            for &(reg, want) in SONY_PADS.0 {
+                 let got = pads(m).get(copy, reg);
+                 if got != want {
+-                    let _ = writeln!(o, "         copy {copy:>2} {:<16} 0x{got:X} (BL2: 0x{want:X})", reg.name());
++                    let _ = writeln!(o, "         copy {copy:>2} {:<16} 0x{got:X} (Sony: 0x{want:X})", reg.name());
+                 }
+             }
+         }
+diff --git a/module/os/apps/zd1-compat/Cargo.toml b/module/os/apps/zd1-compat/Cargo.toml
+--- a/module/os/apps/zd1-compat/Cargo.toml
++++ b/module/os/apps/zd1-compat/Cargo.toml
+@@ -5,5 +5,8 @@
+ license.workspace = true
+ description = "System calls Linux 2.6.24 lacks, for std and tokio programs on the module (src/compat.c)"
+
++[features]
++cpu-profile = []
++
+ [build-dependencies]
+ cc = "1"
+diff --git a/module/os/apps/zd1-compat/build.rs b/module/os/apps/zd1-compat/build.rs
+--- a/module/os/apps/zd1-compat/build.rs
++++ b/module/os/apps/zd1-compat/build.rs
+@@ -1,5 +1,13 @@
+ // The shims (src/compat.c).
+ fn main() {
+     cc::Build::new().file("src/compat.c").flag("-O2").compile("zd1compat");
++    if std::env::var_os("CARGO_FEATURE_CPU_PROFILE").is_some()
++        && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("arm")
++        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
++    {
++        let source = "../../debug/prof.c";
++        println!("cargo:rerun-if-changed={source}");
++        cc::Build::new().file(source).flag("-O2").compile("zd1prof");
++    }
+     println!("cargo:rerun-if-changed=src/compat.c");
+ }
+diff --git a/module/os/apps/zd1-compat/src/lib.rs b/module/os/apps/zd1-compat/src/lib.rs
+--- a/module/os/apps/zd1-compat/src/lib.rs
++++ b/module/os/apps/zd1-compat/src/lib.rs
+@@ -10,3 +10,8 @@
+ pub fn init() {
+     unsafe { zd1_compat_linked() };
+ }
++
++#[cfg(all(feature = "cpu-profile", target_arch = "arm", target_os = "linux"))]
++mod profile;
++#[cfg(all(feature = "cpu-profile", target_arch = "arm", target_os = "linux"))]
++pub use profile::CpuProfile;
+diff --git a/module/os/apps/zd1-compat/src/profile.rs b/module/os/apps/zd1-compat/src/profile.rs
+new file mode 100644
+--- /dev/null
++++ b/module/os/apps/zd1-compat/src/profile.rs
+@@ -0,0 +1,30 @@
++use std::ffi::{CString, c_char, c_int};
++use std::os::unix::ffi::OsStrExt;
++
++unsafe extern "C" {
++    fn zd1_prof_start();
++    fn zd1_prof_stop(path: *const c_char) -> c_int;
++}
++
++/// Sample CPU from process start through a graceful return from its entry point.
++pub struct CpuProfile(CString);
++
++impl CpuProfile {
++    pub fn start() -> Option<Self> {
++        let path = std::env::var_os("ZD1_CPU_PROFILE")?;
++        let path = CString::new(path.as_bytes()).ok()?;
++        unsafe { zd1_prof_start() };
++        Some(Self(path))
++    }
++}
++
++impl Drop for CpuProfile {
++    fn drop(&mut self) {
++        let samples = unsafe { zd1_prof_stop(self.0.as_ptr()) };
++        if samples < 0 {
++            eprintln!("Could not write CPU profile: {}", self.0.to_string_lossy());
++        } else {
++            eprintln!("Wrote {samples} CPU samples to {}", self.0.to_string_lossy());
++        }
++    }
++}
+diff --git a/module/os/apps/zd1-init/Cargo.toml b/module/os/apps/zd1-init/Cargo.toml
+--- a/module/os/apps/zd1-init/Cargo.toml
++++ b/module/os/apps/zd1-init/Cargo.toml
+@@ -9,7 +9,7 @@
+ libc = "0.2"
+ dm870 = { workspace = true, features = ["linux"] }
+ zd1-board.workspace = true
+-zd1-net = { workspace = true, optional = true }
++zd1-net.workspace = true
+ zd1-persparam.workspace = true
+ zd1-settings.workspace = true
+ zd1-slot.workspace = true
+@@ -19,4 +19,4 @@
+ [features]
+ # the system (services.rs: SYSTEM, its early start); the rescue's build (zd1 --no-default-features) leaves it out
+ default = ["full"]
+-full = ["dep:zd1-net"]
++full = []
+diff --git a/module/os/apps/zd1-init/src/bootlog.rs b/module/os/apps/zd1-init/src/bootlog.rs
+new file mode 100644
+--- /dev/null
++++ b/module/os/apps/zd1-init/src/bootlog.rs
+@@ -0,0 +1,80 @@
++//! Send the initial kernel ring over the wired interface once it is usable. syslog action 3 preserves the ring.
++use std::io;
++use std::net::{Ipv4Addr, UdpSocket};
++use std::os::fd::AsRawFd;
++use std::thread;
++use std::time::{Duration, Instant};
++
++const CHUNK_BYTES: usize = 960;
++const PORT: u16 = 6666;
++
++fn ethernet() -> io::Result<UdpSocket> {
++    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
++    let name = b"eth0\0";
++    let rc = unsafe {
++        libc::setsockopt(
++            socket.as_raw_fd(),
++            libc::SOL_SOCKET,
++            libc::SO_BINDTODEVICE,
++            name.as_ptr().cast(),
++            name.len() as libc::socklen_t,
++        )
++    };
++    if rc < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    socket.set_broadcast(true)?;
++    socket.set_nonblocking(true)?;
++    Ok(socket)
++}
++
++fn broadcast(socket: &UdpSocket, id: u32, log: &[u8]) -> io::Result<()> {
++    for (index, chunk) in log.chunks(CHUNK_BYTES).enumerate() {
++        let mut packet = format!("X7BOOT1 DMESG {id} {} {}\n", index * CHUNK_BYTES, log.len()).into_bytes();
++        packet.extend_from_slice(chunk);
++        socket.send_to(&packet, (Ipv4Addr::BROADCAST, PORT))?;
++        // This MAC has a small TX queue. Leave room for the boot DHCP exchange.
++        thread::sleep(Duration::from_millis(10));
++    }
++    Ok(())
++}
++
++fn run() {
++    let start = Instant::now();
++    let mut socket = None;
++    let mut buffer = vec![0u8; 65536];
++    let mut previous = Vec::new();
++    let mut id = 0;
++    let mut sent = None;
++    while start.elapsed() < Duration::from_secs(120) {
++        let n = unsafe { libc::klogctl(3, buffer.as_mut_ptr().cast(), buffer.len() as i32) };
++        if n > 0 {
++            let log = &buffer[..n as usize];
++            if previous != log {
++                id += 1;
++                previous.clear();
++                previous.extend_from_slice(log);
++                sent = None;
++            }
++            if sent.is_none_or(|when: Instant| when.elapsed() >= Duration::from_secs(5)) {
++                if socket.is_none() {
++                    socket = ethernet().ok();
++                }
++                if let Some(s) = &socket {
++                    if broadcast(s, id, log).is_ok() {
++                        sent = Some(Instant::now());
++                    } else {
++                        socket = None;
++                    }
++                }
++            }
++        }
++        thread::sleep(Duration::from_millis(500));
++    }
++}
++
++pub fn start() {
++    if let Err(error) = thread::Builder::new().name("bootlog".into()).stack_size(64 * 1024).spawn(run) {
++        super::say(&format!("bootlog: {error}"));
++    }
++}
+diff --git a/module/os/apps/zd1-init/src/lib.rs b/module/os/apps/zd1-init/src/lib.rs
+--- a/module/os/apps/zd1-init/src/lib.rs
++++ b/module/os/apps/zd1-init/src/lib.rs
+@@ -14,10 +14,11 @@
+ //! "waiting for a system" too. A broken init in a new slot fails its trial boot, and the MCU goes back to the good
+ //! one (docs/module/storage.md).
+
++mod bootlog;
+ mod services;
+ mod start;
+ mod supervisor;
+-#[cfg(feature = "full")]
++#[cfg_attr(not(feature = "full"), allow(dead_code))]
+ mod system;
+
+ /// Which root we run.
+@@ -59,6 +60,18 @@
+     }
+     let profile = Profile::here();
+     let _ = TAG.set(profile.tag());
+-    let boot = start::early(profile);
++    let mut boot = start::early(profile);
++    if profile == Profile::Rescue {
++        // Keep Sony's polled endpoint alive during NAND filesystem scans and
++        // first install, before starting the userspace controller actor.
++        if boot.sony_spi {
++            if let Err(error) = zd1_slot::local::enter() {
++                say(&format!("local boot: {error}; recovery retained"));
++                boot = start::early(profile);
++            }
++        } else {
++            say("Sony SPI driver unavailable; recovery retained");
++        }
++    }
+     supervisor::run(profile, boot)
+ }
+diff --git a/module/os/apps/zd1-init/src/services.rs b/module/os/apps/zd1-init/src/services.rs
+--- a/module/os/apps/zd1-init/src/services.rs
++++ b/module/os/apps/zd1-init/src/services.rs
+@@ -94,6 +94,57 @@
+     Lifetime::Daemon { again_after: Duration::from_millis(again_after_ms) }
+ }
+
++pub(super) const WEB: Service = Service {
++    name: "web",
++    about: "authenticated management and diagnostics on port 80",
++    start: |_| run(&["x7-management", "web", "0.0.0.0:80", "/data/zd1/management", zd1_settings::FILE]),
++    stop: None,
++    lifetime: daemon(2000),
++    output: Output::Log,
++    settings: &[],
++};
++pub(super) const SSH: Service = Service {
++    name: "ssh",
++    about: "Ed25519 authenticated shell on port 22",
++    start: |_| {
++        if !std::path::Path::new("/data/zd1/management/authorized_keys").exists() {
++            Start::Off("provision a public key in the web interface".into())
++        } else {
++            run(&["x7-management", "ssh", "0.0.0.0:22", "/data/zd1/management", "/data/zd1/management/authorized_keys"])
++        }
++    },
++    stop: None,
++    lifetime: daemon(2000),
++    output: Output::Log,
++    settings: &["ssh.keys"],
++};
++
++pub(super) const SONY_SPI: Service = Service {
++    name: "sony-spi",
++    about: "Sony SPI kernel driver and root-only device node",
++    start: |c| {
++        if c.boot.sony_spi {
++            Start::Off("loaded during early boot".into())
++        } else {
++            run(&["x7-management", "driver", "/usr/lib/x7-spi.ko", "/dev/x7-spi"])
++        }
++    },
++    stop: None,
++    lifetime: Lifetime::Once { wait: true, retry: None },
++    output: Output::LogAndKernel,
++    settings: &[],
++};
++
++pub(super) const SONY_LINK: Service = Service {
++    name: "sony-link",
++    about: "Sony controller protocol in recovery",
++    start: |_| run(&["x7-management", "linkd", "/dev/x7-spi", zd1_settings::FILE]),
++    stop: None,
++    lifetime: daemon(1000),
++    output: Output::LogAndKernel,
++    settings: &[],
++};
++
+ /// The system's table is in `system` (the full build only): the rescue's build, which runs only RESCUE, doesn't
+ /// change when a system service does.
+ pub fn table(profile: Profile) -> &'static [Service] {
+@@ -108,14 +159,30 @@
+
+ const RESCUE: &[Service] = &[
+     Service {
+-        name: "zd1-linkd",
+-        about: "the MCU link: \"zd1-os VERSION rescue\", and zd1-update when it asks",
+-        start: |_| run(&["zd1-linkd"]),
++        name: "entropy",
++        about: "credits the kernel entropy pool before management keys are created",
++        // In the cold X7 model, 4096 measurements credited 50 bits against
++        // the kernel's 64-bit read threshold. Keep the estimator and take a
++        // longer sample before starting the key-authenticated recovery services.
++        start: |_| run(&["zd1-entropy", "--samples", "32768"]),
+         stop: None,
+-        lifetime: daemon(1000),
+-        output: Output::LogAndKernel,
++        lifetime: Lifetime::Once { wait: true, retry: None },
++        output: Output::Log,
+         settings: &[],
+     },
++    SONY_SPI,
++    SONY_LINK,
++    Service {
++        name: "ethernet",
++        about: "recovery Ethernet: DHCP, with 169.254.1.1 as direct-link fallback",
++        start: recovery_ethernet,
++        stop: Some(super::system::ethernet_down),
++        lifetime: daemon(2000),
++        output: Output::Log,
++        settings: &[],
++    },
++    WEB,
++    SSH,
+     Service {
+         name: "console",
+         about: "a shell on the console",
+@@ -136,7 +203,7 @@
+             let b = zd1_slot::boot();
+             let name = |s: Option<zd1_slot::Slot>| s.map(|s| s.name()).unwrap_or("?");
+             say(&format!("good slot: {}", name(b.good)));
+-            say("waiting for a system (zd1 update); a shell on the console");
++            say("recovery ready: Ethernet, authenticated web/SSH and the console");
+         }
+     }
+ }
+@@ -146,3 +213,9 @@
+ pub(super) fn shell(_: &Ctx) -> Start {
+     Start::Run(vec![Command { argv: vec!["/bin/sh".into()], arg0: Some("-sh") }])
+ }
++
++fn recovery_ethernet(c: &Ctx) -> Start {
++    let mut settings = c.settings.clone();
++    settings.retain(|key, _| !key.starts_with("eth."));
++    super::system::ethernet(&Ctx { boot: c.boot, settings, debug: c.debug, attempt: c.attempt })
++}
+diff --git a/module/os/apps/zd1-init/src/start.rs b/module/os/apps/zd1-init/src/start.rs
+--- a/module/os/apps/zd1-init/src/start.rs
++++ b/module/os/apps/zd1-init/src/start.rs
+@@ -12,6 +12,7 @@
+     pub cmdline: String,
+     /// When the board came up: the Ethernet PHY needs a moment out of reset.
+     pub board_up: Instant,
++    pub sony_spi: bool,
+ }
+
+ #[cfg_attr(not(feature = "full"), allow(dead_code))]
+@@ -19,11 +20,6 @@
+     /// Whether the command line carries a switch (`zd1.nowifi`).
+     pub fn switch(&self, name: &str) -> bool {
+         self.cmdline.split_whitespace().any(|w| w == name)
+-    }
+-
+-    /// A `key=value` on the command line.
+-    pub fn arg(&self, key: &str) -> Option<&str> {
+-        self.cmdline.split_whitespace().find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+     }
+ }
+
+@@ -47,6 +43,10 @@
+ /// talks to the MCU, which can put a working one back.
+ pub fn early(profile: Profile) -> Boot {
+     let _ = mount("proc", "/proc", "proc", 0, "");
++    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default().trim().to_string();
++    if cmdline.split_whitespace().any(|word| word == "x7.bootlog") {
++        super::bootlog::start();
++    }
+     let _ = mount("sys", "/sys", "sysfs", 0, "");
+     // the kernel's log on the console too (it starts at level 1): the UART our MCU logs
+     let _ = std::fs::write("/proc/sys/kernel/printk", "7");
+@@ -73,64 +73,61 @@
+         let _ = zd1_slot::mtd(name);
+     }
+
+-    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default().trim().to_string();
+-    let boot = Boot { cmdline, board_up: Instant::now() };
++    // On the physical X7 the SPI control registers read their reset values
++    // when the driver loaded before the board clocks. Set those clocks first.
++    board();
++    let board_up = Instant::now();
++    let sony_spi = matches!(std::process::Command::new("/usr/bin/x7-management")
++        .args(["driver", "/usr/lib/x7-spi.ko", "/dev/x7-spi"]).status(), Ok(status) if status.success());
++    let boot = Boot { cmdline, board_up, sony_spi };
+     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default().trim().to_string();
+-    match profile {
++    let board_up = match profile {
+         #[cfg(feature = "full")]
+-        Profile::System => super::system::early(&boot, &kernel),
++        Profile::System => {
++            super::system::early(&boot, &kernel);
++            // The vendor modules also program shared clock gates and pads.
++            board();
++            Instant::now()
++        }
+         #[cfg(not(feature = "full"))]
+         Profile::System => unreachable!("the rescue's build has no system"),
+         Profile::Rescue => {
+             let release = OsRelease::read("/etc/os-release");
+             say(&format!("zd1 rescue {}, kernel {kernel}", release.get("VERSION_ID")));
+-            data(false);
++            data();
++            boot.board_up
++        }
++    };
++    if let Ok(slot) = std::env::var("SONY_X7_SLOT")
++        && zd1_slot::Slot::parse(&slot).is_some()
++    {
++        let _ = std::fs::write("/run/zd1/slot", slot);
++    }
++    Boot { board_up, ..boot }
++}
++
++/// Probe Sony NAND read-only. Only an explicitly initialized data volume may be mounted writable.
++pub(super) fn data() {
++    let mut persistent = false;
++    if let Some(n) = zd1_slot::mtd("data") {
++        let block = format!("/dev/mtdblock{n}");
++        if mount(&block, "/data", "jffs2", libc::MS_RDONLY, "").is_ok() {
++            let initialized = std::path::Path::new("/data/.zd1-data").is_file();
++            umount("/data");
++            persistent = initialized && mount(&block, "/data", "jffs2", 0, "").is_ok();
+         }
+     }
+-    board();
+-    Boot { board_up: Instant::now(), ..boot }
++    if !persistent {
++        say("data: using RAM; persistent data is not initialized or is unavailable");
++        let _ = mount("data", "/data", "tmpfs", 0, "size=1m");
++    }
++    let _ = std::fs::create_dir_all("/data/zd1");
++    if let Err(error) = zd1_slot::local::provision() {
++        say(&format!("provisioning: {error}"));
++    }
+ }
+
+-/// /data, the settings (docs/module/settings.md). A partition that isn't ours yet (no /data/.zd1-data: new, or the
+-/// stock firmware's leftovers) is formatted once by the system, never again for a new image (every version reads
+-/// what another wrote); the rescue only mounts ours. None, or no luck: RAM until the next boot.
+-pub(super) fn data(may_format: bool) {
+-    const MARK: &str = "/data/.zd1-data";
+-    const DATA_IN_RAM: &str = "size=1m"; // the settings and the AirPlay pairing: a few KB
+-    let Some(n) = zd1_slot::mtd("data") else {
+-        say("data: no partition (no mtdparts on the kernel command line): settings in RAM until the next boot");
+-        let _ = mount("data", "/data", "tmpfs", 0, DATA_IN_RAM);
+-        return;
+-    };
+-    let block = format!("/dev/mtdblock{n}");
+-    let ours = mount(&block, "/data", "jffs2", 0, "").is_ok() && std::path::Path::new(MARK).exists();
+-    if !ours {
+-        umount("/data");
+-        let formatted = may_format && {
+-            say("data: formatting the data partition");
+-            match zd1_slot::erase(n) {
+-                Ok(_) => mount(&block, "/data", "jffs2", 0, "").is_ok() && std::fs::write(MARK, "").is_ok(),
+-                Err(e) => {
+-                    say(&format!("data: {e}"));
+-                    false
+-                }
+-            }
+-        };
+-        if !formatted {
+-            if may_format {
+-                say("data: FAILED: settings in RAM until the next boot");
+-            }
+-            umount("/data");
+-            let _ = mount("data", "/data", "tmpfs", 0, DATA_IN_RAM);
+-        }
+-        unsafe {
+-            libc::sync();
+-        }
+-    }
+-    let _ = std::fs::create_dir_all("/data/zd1");
+-}
+-
+-/// The board (module/os/apps/zd1-board): after the modules, so what the drivers own stays as they left it.
++/// Route the Sony carrier and release the Ethernet PHY once its clock is available.
+ fn board() {
+     match DevMem::open() {
+         Ok(mut mem) => {
+diff --git a/module/os/apps/zd1-init/src/supervisor.rs b/module/os/apps/zd1-init/src/supervisor.rs
+--- a/module/os/apps/zd1-init/src/supervisor.rs
++++ b/module/os/apps/zd1-init/src/supervisor.rs
+@@ -164,13 +164,15 @@
+         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
+         for sig in signals.pending() {
+             match sig {
+-                libc::SIGCHLD => s.reap(),
+                 libc::SIGTERM => s.shutdown("reboot", libc::RB_AUTOBOOT),
+                 libc::SIGUSR2 => s.shutdown("poweroff", libc::RB_POWER_OFF),
+                 libc::SIGUSR1 => s.shutdown("halt", libc::RB_HALT_SYSTEM),
+                 _ => {}
+             }
+         }
++        // A coalesced SIGCHLD on the X7 left an exited service marked running.
++        // Reap on every existing wake, including a closed service output pipe.
++        s.reap();
+         if let Ok(l) = &control {
+             while let Ok((c, _)) = l.accept() {
+                 if c.set_nonblocking(true).is_ok() {
+@@ -278,6 +280,9 @@
+         loop {
+             let mut status = 0;
+             let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
++            if pid < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
++                continue;
++            }
+             if pid <= 0 {
+                 return;
+             }
+diff --git a/module/os/apps/zd1-net/src/cli.rs b/module/os/apps/zd1-net/src/cli.rs
+--- a/module/os/apps/zd1-net/src/cli.rs
++++ b/module/os/apps/zd1-net/src/cli.rs
+@@ -61,7 +61,7 @@
+             }
+             let gw = routers.first().map(|g| format!(" router {g}")).unwrap_or_default();
+             say(&format!("{name} {event} {ip}{gw}"));
+-            if before != Some(ip) {
++            if before != Some(ip) && std::path::Path::new("/usr/bin/zd1-airplay").exists() {
+                 // its mDNS records carry the old address (none, or the link-local one before the lease)
+                 say(&format!("{name}: a new address: restarting airplay"));
+                 let _ = zd1_svc::request("restart airplay");
+diff --git a/module/os/apps/zd1-settings/src/lib.rs b/module/os/apps/zd1-settings/src/lib.rs
+--- a/module/os/apps/zd1-settings/src/lib.rs
++++ b/module/os/apps/zd1-settings/src/lib.rs
+@@ -121,6 +121,15 @@
+     put_lines(path, &[(name, v)])
+ }
+
++/// Validate an entire form before replacing its settings in one atomic write.
++pub fn set_many_in(path: &str, values: &[(&str, &str)]) -> Result<(), String> {
++    for &(name, value) in values {
++        let field = field(name).ok_or_else(|| format!("no setting {name}"))?;
++        check(field, value).map_err(|error| format!("{name}: {error}"))?;
++    }
++    put_lines(path, values)
++}
++
+ /// The lines for these keys replaced (an empty value: the line gone), the others kept.
+ fn put_lines(path: &str, set: &[(&str, &str)]) -> Result<(), String> {
+     let old = std::fs::read_to_string(path).unwrap_or_default();
+@@ -165,7 +174,7 @@
+     zd1_hostlink::actions().map(|f| f.key())
+ }
+
+-/// The name before anyone chose one: "Zeppelin Air XXXXXX" from the unit's MAC.
++/// The name before anyone chose one: "SRS-X7 XXXXXX" from the unit's MAC.
+ pub fn default_name() -> String {
+     zd1_sys::default_name(zd1_persparam::unit_mac().ok())
+ }
+diff --git a/module/os/apps/zd1-slot/src/cli.rs b/module/os/apps/zd1-slot/src/cli.rs
+--- a/module/os/apps/zd1-slot/src/cli.rs
++++ b/module/os/apps/zd1-slot/src/cli.rs
+@@ -3,14 +3,33 @@
+ //!   zd1-slot install SLOT ID    a gzip'd cpio of a root on stdin into SLOT (a, b), stamped ID
+ //!   zd1-slot erase NAME         partition NAME (system-a, system-b, data) erased as from the factory, but for the
+ //!                               cleanmarkers (bad blocks left alone); refused while it is mounted. The vendor's: never
+-//! Which slot starts is the MCU's (`zd1 slot`).
++//! On the X7, stage and confirm control the next boot from the network module.
+
+-use crate::{Slot, boot, erase, install, mtd};
++use crate::{Slot, erase, install, mtd};
+
+ pub fn main() {
+     let args: Vec<String> = std::env::args().skip(1).collect();
+     let a: Vec<&str> = args.iter().map(String::as_str).collect();
+     match a.as_slice() {
++        ["initialize-data"] => {
++            if let Err(error) = crate::local::initialize_data() {
++                die(&error);
++            }
++            println!("data initialized; reboot to use persistent settings and stage a system");
++        }
++        ["stage", slot] => {
++            let Some(slot) = Slot::parse(slot) else { die("SLOT: a or b") };
++            if let Err(error) = crate::local::stage(slot) {
++                die(&error);
++            }
++            println!("slot {} will be tried on the next boot", slot.name());
++        }
++        ["confirm"] => {
++            if let Err(error) = crate::local::confirm() {
++                die(&error);
++            }
++            println!("running system confirmed");
++        }
+         ["mtd", name] => match mtd(name) {
+             Some(n) => println!("{n}"),
+             None => die(&format!("no partition \"{name}\"")),
+@@ -23,12 +42,19 @@
+             }
+         }
+         ["erase", name @ ("system-a" | "system-b" | "data")] => {
++            let _lock = crate::lock(true).unwrap_or_else(|| die("could not lock storage"));
++            if let Some(slot) = [Slot::A, Slot::B].into_iter().find(|slot| slot.partition() == *name)
++                && let Err(error) = crate::check_system_write(slot)
++            {
++                die(&error);
++            }
+             let Some(n) = mtd(name) else { die(&format!("no partition \"{name}\"")) };
+             // mounted (/data, or the running root: /dev/root in /proc/mounts): erasing it under the file system would
+             // wreck what runs
+-            let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+-            let root = boot().running.map(|s| s.partition()) == Some(*name);
+-            if root || mounts.lines().any(|l| l.split(' ').next() == Some(&format!("/dev/mtdblock{n}"))) {
++            let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_else(|error| die(&error.to_string()));
++            let block = format!("/dev/mtdblock{n}");
++            let mtd = format!("mtd:{name}");
++            if mounts.lines().any(|line| line.split_whitespace().next().is_some_and(|src| src == block || src == mtd)) {
+                 die(&format!("{name} (mtd{n}) is mounted: unmount it first (the rescue: `umount /data`)"));
+             }
+             match erase(n) {
+@@ -37,7 +63,9 @@
+             }
+         }
+         _ => {
+-            eprintln!("usage: zd1-slot mtd NAME | install SLOT ID < IMAGE | erase system-a|system-b|data");
++            eprintln!(
++                "usage: zd1-slot initialize-data | mtd NAME | install SLOT ID < IMAGE | stage a|b | confirm | erase system-a|system-b|data"
++            );
+             std::process::exit(2);
+         }
+     }
+diff --git a/module/os/apps/zd1-slot/src/lib.rs b/module/os/apps/zd1-slot/src/lib.rs
+--- a/module/os/apps/zd1-slot/src/lib.rs
++++ b/module/os/apps/zd1-slot/src/lib.rs
+@@ -1,11 +1,10 @@
+ //! The system slots (docs/module/storage.md): two MTD partitions, `system-a` and `system-b`, each a whole root file
+-//! system (JFFS2, read-only once installed: busybox, zd1, /etc, /usr) that the boot stub mounts as the root. The MCU
+-//! decides which one starts (mcu/src/modboot.c) and the stub puts it on the kernel command line: `zd1.slot=a|b` (or
+-//! `zd1.rescue`), and `zd1.good=a|b`, the slot the MCU falls back to. A slot holds a system when it has /sbin/init and
++//! system (JFFS2, read-only once installed: busybox, zd1, /etc, /usr). Sony's module-owned selection and explicit
++//! confirmation live in `local`; the original Sony controller does not select Linux slots. A slot holds a system when it has /sbin/init and
+ //! its stamp, /.zd1-system: what was installed, written last (an interrupted install leaves none).
+ //! Writing one: [`install`] erases the partition as `flash_eraseall -j` does (JFFS2 cleanmarkers in the spare areas),
+-//! mounts it, unpacks a gzip'd newc cpio of the root into it, writes the stamp. Never the running slot, nor the good
+-//! one while another runs on trial (it is the way back).
++//! mounts it, unpacks a gzip'd newc cpio of the root into it, writes the stamp. Never the running or confirmed slot,
++//! including while recovery is running: the confirmed system is the way back.
+
+ use std::fs::{self, OpenOptions};
+ use std::io::{self, Read, Write};
+@@ -16,6 +15,7 @@
+ use zd1_sys::{cstr, mknod, mtd as ioctl};
+
+ mod gunzip;
++pub mod local;
+
+ pub const STAMP: &str = ".zd1-system";
+
+@@ -63,23 +63,44 @@
+ }
+
+ impl Boot {
+-    /// Where an update goes: the slot that doesn't run (the rescue, or an initramfs: the good one).
++    /// The inactive candidate. In recovery, preserve the confirmed system.
++    /// Installation still checks whether both slots are currently protected.
+     pub fn target(&self) -> Slot {
+         match self.running {
+             Some(s) => s.other(),
+-            None => self.good.unwrap_or(Slot::A),
+-        }
+-    }
+-}
+-
+-/// The good slot is the MCU's latest word: /run/zd1/good (zd1-linkd, from reg 0xC4 at every ready: a trial the MCU
+-/// has confirmed since the boot), else the command line's.
++            None => self.good.map(Slot::other).unwrap_or(Slot::A),
++        }
++    }
++    fn check_install(&self, slot: Slot) -> Result<(), String> {
++        if self.running == Some(slot) {
++            return Err(format!("slot {} is running", slot.name()));
++        }
++        if self.good == Some(slot) {
++            return Err(format!("slot {} is the confirmed fallback", slot.name()));
++        }
++        Ok(())
++    }
++}
++
++/// Read the module-owned confirmed system and the running root's slot marker.
+ pub fn boot() -> Boot {
++    boot_with_good(local::good().unwrap_or_default())
++}
++
++fn boot_with_good(good: Option<Slot>) -> Boot {
+     let c = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+-    let get = |k: &str| c.split_whitespace().find_map(|w| w.strip_prefix(k)).and_then(Slot::parse);
+-    let good = fs::read_to_string("/run/zd1/good").ok().and_then(|g| Slot::parse(g.trim())).or(get("zd1.good="));
++    let running = fs::read_to_string("/run/zd1/slot")
++        .ok()
++        .and_then(|s| Slot::parse(s.trim()))
++        .or_else(|| std::env::var("SONY_X7_SLOT").ok().as_deref().and_then(Slot::parse));
+     let image = c.split_whitespace().find_map(|w| w.strip_prefix("zd1.boot=")).unwrap_or_default().to_string();
+-    Boot { running: get("zd1.slot="), good, rescue: c.split_whitespace().any(|w| w == "zd1.rescue"), image }
++    Boot { running, good, rescue: running.is_none() && c.split_whitespace().any(|w| w == "zd1.rescue"), image }
++}
++
++fn check_system_write(slot: Slot) -> Result<(), String> {
++    local::require_persistent_data()?;
++    let good = local::good().map_err(|error| format!("cannot verify the confirmed fallback: {error}"))?;
++    boot_with_good(good).check_install(slot)
+ }
+
+ /// The MTD number of partition `name` (/proc/mtd), its device nodes made (mdev on 2.6.24 makes neither the character
+@@ -165,7 +186,7 @@
+
+ fn stamp_from_slot(s: Slot) -> Option<String> {
+     let n = mtd(s.partition())?;
+-    let _lock = lock(false);
++    let _lock = lock(false)?;
+     static READS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // threads share the pid
+     let k = READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+     let at = format!("/tmp/zd1-slot.{}.r{}.{k}", s.name(), std::process::id());
+@@ -314,23 +335,14 @@
+     image: &mut R,
+     check: &mut dyn FnMut(&mut R) -> Result<(), String>,
+ ) -> Result<String, String> {
+-    let b = boot();
+-    if b.running == Some(s) {
+-        return Err(format!("slot {} is running", s.name()));
+-    }
+-    if let (Some(run), Some(good)) = (b.running, b.good)
+-        && run != good
+-        && s == good
+-    {
+-        return Err(format!("slot {} is the good one and slot {} runs on trial: the way back", s.name(), run.name()));
+-    }
+     if id.is_empty() || id.contains('\n') {
+         return Err("a one-line ID".into());
+     }
++    let _lock = lock(true).ok_or("could not lock storage")?;
++    check_system_write(s)?;
+     let n = mtd(s.partition()).ok_or(format!("no partition {}", s.partition()))?;
+     let at = format!("/tmp/zd1-slot.{}", s.name());
+     fs::create_dir_all(&at).map_err(|e| format!("{at}: {e}"))?;
+-    let _lock = lock(true); // a stamp read of this slot ends first (seconds: its mount scans the JFFS2)
+     umount(&at);
+     let _ = zd1_sys::write_private(&record(s), "\n"); // no system from here until the stamp
+     let bad = erase(n)?;
+@@ -378,3 +390,34 @@
+ // the program (zd1-slot), in the multicall (module/os/apps/zd1)
+ mod cli;
+ pub use cli::main;
++
++#[cfg(test)]
++mod protection_tests {
++    use super::*;
++    fn state(running: Option<Slot>, good: Option<Slot>) -> Boot {
++        Boot { running, good, rescue: running.is_none(), image: String::new() }
++    }
++    #[test]
++    fn recovery_preserves_the_confirmed_system_and_targets_the_other_slot() {
++        let recovery = state(None, Some(Slot::A));
++        assert_eq!(recovery.target(), Slot::B);
++        assert!(recovery.check_install(Slot::A).is_err());
++        assert!(recovery.check_install(Slot::B).is_ok());
++    }
++    #[test]
++    fn a_trial_cannot_overwrite_either_itself_or_its_fallback() {
++        let trial = state(Some(Slot::B), Some(Slot::A));
++        assert!(trial.check_install(Slot::A).is_err());
++        assert!(trial.check_install(Slot::B).is_err());
++        let confirmed = state(Some(Slot::B), Some(Slot::B));
++        assert!(confirmed.check_install(Slot::A).is_ok());
++        assert!(confirmed.check_install(Slot::B).is_err());
++    }
++    #[test]
++    fn first_install_has_no_confirmed_slot_to_destroy() {
++        let recovery = state(None, None);
++        assert_eq!(recovery.target(), Slot::A);
++        assert!(recovery.check_install(Slot::A).is_ok());
++        assert!(recovery.check_install(Slot::B).is_ok());
++    }
++}
+diff --git a/module/os/apps/zd1-slot/src/local.rs b/module/os/apps/zd1-slot/src/local.rs
+new file mode 100644
+--- /dev/null
++++ b/module/os/apps/zd1-slot/src/local.rs
+@@ -0,0 +1,236 @@
++//! Module-owned boot selection. Sony's controller never sees Linux slots.
++//! Persist the attempted trial before switching roots; a reset then selects
++//! the confirmed system, or recovery. Confirmation is an explicit owner action.
++use crate::{STAMP, Slot};
++use std::{fs, os::unix::process::CommandExt, path::Path, process::Command};
++
++const STATE: &str = "/data/zd1/boot-state";
++
++/// Per-unit public login keys and a generated web credential. Existing owner
++/// changes always take precedence over the immutable provisioning bundle.
++pub fn provision() -> Result<(), String> {
++    let destination = "/data/zd1/management";
++    fs::create_dir_all(destination).map_err(|e| e.to_string())?;
++    for name in ["authorized_keys", "web-password"] {
++        let source = format!("/usr/share/x7/provisioning/{name}");
++        let target = format!("{destination}/{name}");
++        if !Path::new(&target).exists() && Path::new(&source).exists() {
++            let value = fs::read_to_string(&source).map_err(|e| e.to_string())?;
++            if value.len() > 8192 {
++                return Err("provisioning file exceeds 8 KiB".into());
++            }
++            zd1_sys::write_private(&target, &value).map_err(|e| e.to_string())?;
++        }
++    }
++    Ok(())
++}
++
++/// First-time owner operation from recovery. The running RAM-backed /data stays
++/// available until reboot, including the credentials used for this session.
++pub fn initialize_data() -> Result<(), String> {
++    if zd1_sys::OsRelease::read("/etc/os-release").get("VARIANT_ID") != "rescue" {
++        return Err("initialize-data requires wired recovery".into());
++    }
++    let _lock = crate::lock(true).ok_or("could not lock storage")?;
++    let layout = fs::read_to_string("/proc/mtd").map_err(|e| e.to_string())?;
++    for (name, size) in [("vendor", 64u32), ("system-a", 24), ("system-b", 24), ("data", 16)] {
++        if !layout.lines().any(|line| {
++            line.split('"').nth(1) == Some(name)
++                && line.split_whitespace().nth(1).and_then(|s| u32::from_str_radix(s, 16).ok()) == Some(size << 20)
++        }) {
++            return Err("unexpected Sony NAND layout".into());
++        }
++    }
++    if Path::new("/data/.zd1-data").is_file() {
++        return Ok(());
++    }
++    let number = crate::mtd("data").ok_or("data partition unavailable")?;
++    let block = format!("/dev/mtdblock{number}");
++    let target = "/run/x7-data-setup";
++    fs::create_dir_all(target).map_err(|e| e.to_string())?;
++    // A completed request can be retried before reboot without erasing it again.
++    if crate::mount(&block, target, true).is_ok() {
++        let initialized = Path::new(target).join(".zd1-data").is_file();
++        zd1_sys::umount(target);
++        if initialized {
++            return Ok(());
++        }
++    }
++    let mounts = fs::read_to_string("/proc/mounts").map_err(|e| e.to_string())?;
++    if mounts.lines().any(|line| {
++        let source = line.split_whitespace().next();
++        source == Some(block.as_str()) || source == Some("mtd:data")
++    }) {
++        return Err("data partition is still mounted".into());
++    }
++    crate::erase(number)?;
++    crate::mount(&block, target, false)?;
++    let result = zd1_sys::write_private(&format!("{target}/.zd1-data"), "");
++    let unmounted = unsafe { libc::umount(zd1_sys::cstr(target).as_ptr()) };
++    if unmounted != 0 {
++        return Err(std::io::Error::last_os_error().to_string());
++    }
++    result.map_err(|e| e.to_string())
++}
++
++#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
++struct State {
++    good: Option<Slot>,
++    trial: Option<Slot>,
++    attempted: bool,
++}
++
++impl State {
++    fn parse(text: &str) -> Result<Self, String> {
++        let mut words = text.split_whitespace();
++        let (Some("X7BOOT1"), Some(good), Some(trial), Some(attempted), None) =
++            (words.next(), words.next(), words.next(), words.next(), words.next())
++        else {
++            return Err("invalid local boot state".into());
++        };
++        let slot = |word: &str| {
++            if word == "-" { Ok(None) } else { Slot::parse(word).map(Some).ok_or("invalid local boot slot") }
++        };
++        Ok(Self {
++            good: slot(good)?,
++            trial: slot(trial)?,
++            attempted: match attempted {
++                "0" => false,
++                "1" => true,
++                _ => return Err("invalid boot attempt".into()),
++            },
++        })
++    }
++    fn text(self) -> String {
++        format!(
++            "X7BOOT1 {} {} {}\n",
++            self.good.map_or("-", Slot::name),
++            self.trial.map_or("-", Slot::name),
++            u8::from(self.attempted)
++        )
++    }
++    fn next(&mut self) -> Option<Slot> {
++        if let Some(trial) = self.trial
++            && !self.attempted
++        {
++            self.attempted = true;
++            return Some(trial);
++        }
++        self.trial = None;
++        self.attempted = false;
++        self.good
++    }
++}
++
++fn load() -> Result<State, String> {
++    match fs::read_to_string(STATE) {
++        Ok(text) if text.len() <= 64 => State::parse(&text),
++        Ok(_) => Err("local boot state exceeds 64 bytes".into()),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
++        Err(error) => Err(error.to_string()),
++    }
++}
++
++pub(super) fn require_persistent_data() -> Result<(), String> {
++    if Path::new("/data/.zd1-data").is_file() { Ok(()) } else { Err("persistent data is unavailable".into()) }
++}
++
++fn save(state: State) -> Result<(), String> {
++    require_persistent_data()?;
++    zd1_sys::write_private(STATE, &state.text()).map_err(|e| e.to_string())?;
++    unsafe {
++        libc::sync();
++    }
++    Ok(())
++}
++
++pub(super) fn good() -> Result<Option<Slot>, String> {
++    Ok(load()?.good)
++}
++
++pub fn stage(slot: Slot) -> Result<(), String> {
++    if crate::stamp(slot).is_none() {
++        return Err("target slot has no complete system".into());
++    }
++    let _lock = crate::lock(true).ok_or("could not lock storage")?;
++    let mut state = load()?;
++    if state.good == Some(slot) {
++        return Err("target is already the confirmed system".into());
++    }
++    state.trial = Some(slot);
++    state.attempted = false;
++    save(state)
++}
++
++pub fn confirm() -> Result<(), String> {
++    let _lock = crate::lock(true).ok_or("could not lock storage")?;
++    let running = crate::boot().running.ok_or("recovery has no running slot to confirm")?;
++    let mut state = load()?;
++    if state.trial != Some(running) || !state.attempted {
++        return Err("the running system is not an attempted trial".into());
++    }
++    state.good = Some(running);
++    state.trial = None;
++    state.attempted = false;
++    save(state)
++}
++
++/// Called by PID 1 after early mounts, before any daemon. Returns to the
++/// retained recovery when selection, validation or execution fails.
++pub fn enter() -> Result<(), String> {
++    let mut state = load()?;
++    let previous = state;
++    let chosen = state.next();
++    if state != previous {
++        save(state)?;
++    }
++    let Some(slot) = chosen else {
++        return Ok(());
++    };
++    // Clear a spent trial, or mark this attempt, durably before root execution.
++    let number = crate::mtd(slot.partition()).ok_or("system partition is unavailable")?;
++    let root = "/mnt/system";
++    fs::create_dir_all(root).map_err(|e| e.to_string())?;
++    zd1_sys::mount(&format!("/dev/mtdblock{number}"), root, "jffs2", libc::MS_RDONLY, "").map_err(|e| e.to_string())?;
++    if fs::read_to_string(format!("{root}/{STAMP}")).is_err() || !Path::new(&format!("{root}/sbin/init")).exists() {
++        zd1_sys::umount(root);
++        return Err("selected system has no completed stamp or init".into());
++    }
++    eprintln!("[x7-boot] slot {}, confirmed {}", slot.name(), state.good.map_or("none", Slot::name));
++    // switch_root frees the RAM root. Unmount its auxiliary filesystems first;
++    // the new init creates them anew. Its static /dev/console is in the archive.
++    for path in ["/data", "/dev/pts", "/dev", "/sys", "/proc", "/run", "/tmp", "/var"] {
++        zd1_sys::umount(path);
++        // An inherited console fd may keep /dev busy. Detach the old mount
++        // now; switch_root replaces those descriptors before the new init.
++        let path = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
++        unsafe {
++            libc::umount2(path.as_ptr(), libc::MNT_DETACH);
++        }
++    }
++    let error = Command::new("/bin/busybox")
++        .args(["switch_root", "-c", "/dev/console", root, "/sbin/init"])
++        .env("SONY_X7_SLOT", slot.name())
++        .exec();
++    Err(format!("switch_root failed: {error}"))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn interrupted_trial_returns_to_the_confirmed_system() {
++        let mut state = State { good: Some(Slot::A), trial: Some(Slot::B), attempted: false };
++        assert_eq!(state.next(), Some(Slot::B));
++        let mut after_reset = State::parse(&state.text()).unwrap();
++        assert_eq!(after_reset.next(), Some(Slot::A));
++        assert_eq!(after_reset.trial, None);
++    }
++    #[test]
++    fn first_install_returns_to_recovery_without_confirmation() {
++        let mut state = State { trial: Some(Slot::A), ..State::default() };
++        assert_eq!(state.next(), Some(Slot::A));
++        assert_eq!(state.next(), None);
++        assert!(State::parse("X7BOOT1 a b 9").is_err());
++    }
++}
+diff --git a/module/os/apps/zd1-snapcast/src/player.rs b/module/os/apps/zd1-snapcast/src/player.rs
+--- a/module/os/apps/zd1-snapcast/src/player.rs
++++ b/module/os/apps/zd1-snapcast/src/player.rs
+@@ -39,6 +39,7 @@
+
+ pub fn run(device: String, shared: Arc<Mutex<Shared>>) {
+     let mut buf = vec![0i32; PERIOD * 2];
++    let speaker = shared.lock().unwrap().speaker.clone();
+     loop {
+         // open the device only for a server (its clock is known once a session runs), and not while another source
+         // has the speaker
+@@ -48,7 +49,7 @@
+         } {
+             std::thread::sleep(Duration::from_millis(100));
+         }
+-        let mut dev = match Device::open(&device, OUT_RATE, PERIODS, false) {
++        let mut dev = match Device::open(&device, OUT_RATE, PERIODS, false, &speaker) {
+             Ok(d) => d,
+             Err(e) => {
+                 tracing::warn!(device, %e, "can't open the output");
+diff --git a/module/os/apps/zd1-spotify/src/lib.rs b/module/os/apps/zd1-spotify/src/lib.rs
+--- a/module/os/apps/zd1-spotify/src/lib.rs
++++ b/module/os/apps/zd1-spotify/src/lib.rs
+@@ -213,6 +213,10 @@
+         tracing::info!(got = dec.seek(ms).expect("seek"), ms, "seek");
+     }
+     let speaker = Speaker::start(SOURCE, |_| {});
++    if !speaker.request_local_output(device, std::time::Duration::from_secs(25)) {
++        eprintln!("Local file: Sony did not grant playback");
++        std::process::exit(1);
++    }
+     let out = Output::start(device.to_string(), speaker.clone());
+     let mut sink = sink::OutputSink::new(out.clone(), speaker);
+     let mut converter = librespot_playback::convert::Converter::new(None);
+diff --git a/module/os/apps/zd1-sys/src/lib.rs b/module/os/apps/zd1-sys/src/lib.rs
+--- a/module/os/apps/zd1-sys/src/lib.rs
++++ b/module/os/apps/zd1-sys/src/lib.rs
+@@ -186,12 +186,11 @@
+     parse_mac(&std::fs::read_to_string("/sys/class/net/eth0/address").ok()?)
+ }
+
+-/// The speaker's name before anyone chose one: "Zeppelin Air XXXXXX" from its MAC's last three bytes, like the stock
+-/// module.
++/// The speaker's name before anyone chose one, with its MAC's last three bytes.
+ pub fn default_name(mac: Option<Mac>) -> String {
+     match mac {
+-        Some(m) => format!("Zeppelin Air {:02X}{:02X}{:02X}", m[3], m[4], m[5]),
+-        None => "Zeppelin Air".into(),
++        Some(m) => format!("SRS-X7 {:02X}{:02X}{:02X}", m[3], m[4], m[5]),
++        None => "SRS-X7".into(),
+     }
+ }
+
+@@ -218,6 +217,6 @@
+         assert_eq!(parse_mac("ec:66:d1:00:00:4"), None);
+-        assert_eq!(default_name(Some(m)), "Zeppelin Air 000042");
+-        assert_eq!(default_name(None), "Zeppelin Air");
++        assert_eq!(default_name(Some(m)), "SRS-X7 000042");
++        assert_eq!(default_name(None), "SRS-X7");
+     }
+
+     #[test]
+diff --git a/module/os/apps/zd1/Cargo.toml b/module/os/apps/zd1/Cargo.toml
+--- a/module/os/apps/zd1/Cargo.toml
++++ b/module/os/apps/zd1/Cargo.toml
+@@ -7,12 +7,13 @@
+
+ [features]
+ default = ["full"]
++cpu-profile = ["zd1-compat/cpu-profile"]
+ # everything beyond what the rescue runs (docs/module/storage.md): the system's services and the receivers. The
+ # rescue's copy is the core alone: --no-default-features
+-full = ["zd1-init/full", "dep:zd1-net", "dep:zd1-entropy", "dep:zd1-snapcast", "dep:zd1-airplay", "dep:zd1-spotify"]
++full = ["zd1-init/full", "dep:zd1-snapcast", "dep:zd1-airplay", "dep:zd1-spotify"]
+ # the system's debug build (os.toml [image.debug]): the self test, the memory shell, PersParam's raw reads, the MCU
+ # link's request trace
+-debug = ["full", "dep:zd1-selftest", "dep:zd1-memsh", "zd1-linkd/debug", "zd1-persparam/debug"]
++debug = ["full", "dep:zd1-selftest", "dep:zd1-memsh", "zd1-persparam/debug"]
+
+ [dependencies]
+ zd1-compat.workspace = true
+@@ -20,14 +21,12 @@
+ zd1-init = { workspace = true, default-features = false }
+ zd1-ctl.workspace = true
+ zd1-board.workspace = true
+-zd1-linkd.workspace = true
+ zd1-persparam.workspace = true
+ zd1-settings.workspace = true
+ zd1-slot.workspace = true
+-zd1-update.workspace = true
+ # the rest
+-zd1-net = { workspace = true, optional = true }
+-zd1-entropy = { workspace = true, optional = true }
++zd1-net.workspace = true
++zd1-entropy.workspace = true
+ zd1-selftest = { workspace = true, optional = true }
+ zd1-memsh = { workspace = true, optional = true }
+ zd1-snapcast = { workspace = true, optional = true }
+diff --git a/module/os/apps/zd1/src/main.rs b/module/os/apps/zd1/src/main.rs
+--- a/module/os/apps/zd1/src/main.rs
++++ b/module/os/apps/zd1/src/main.rs
+@@ -14,16 +14,12 @@
+ /// The programs: name, entry point.
+ const PROGRAMS: &[(&str, fn())] = &[
+     ("init", zd1_init::main), // /sbin/init, the rescue's /init: PID 1
+-    ("zd1-linkd", zd1_linkd::main),
+     ("zd1-ctl", zd1_ctl::main),
+     ("zd1-board", zd1_board::main),
+     ("zd1-persparam", zd1_persparam::main),
+     ("zd1-settings", zd1_settings::main),
+     ("zd1-slot", zd1_slot::main),
+-    ("zd1-update", zd1_update::main),
+-    #[cfg(feature = "full")]
+     ("zd1-dhcp", zd1_net::main),
+-    #[cfg(feature = "full")]
+     ("zd1-entropy", zd1_entropy::main),
+     #[cfg(feature = "full")]
+     ("zd1-snapcast", zd1_snapcast::main),
+@@ -46,6 +42,8 @@
+     let mut args = std::env::args();
+     let argv0 = args.next().unwrap_or_default();
+     if let Some((_, run)) = find(argv0.rsplit('/').next().unwrap_or("")) {
++        #[cfg(all(feature = "cpu-profile", target_arch = "arm", target_os = "linux"))]
++        let _profile = zd1_compat::CpuProfile::start();
+         return run();
+     }
+     if let Some(&(name, _)) = args.next().as_deref().and_then(find) {
+diff --git a/module/os/mkpayload.py b/module/os/mkpayload.py
+--- a/module/os/mkpayload.py
++++ b/module/os/mkpayload.py
+@@ -6,8 +6,8 @@
+   0x000  trampoline: copies the stub to 0x61F00000 and jumps there (position independent, 12 words)
+   0x040  header 'ZLB1': +0x08 stub off, +0x0C stub len, +0x10 kernel off, +0x14 kernel len, +0x18 initrd off,
+          +0x1C initrd len, +0x20 reserved (0), +0x24 machine id, +0x28 initrd destination
+-         (0 = the stub's default 0x61800000), +0x2C flags (bit 0: system slots, the initramfs is the rescue: the stub
+-         asks the MCU which to start), +0x30 the kernel's inflated length (0: stored as it is; else +0x14 is the
++         (0 = the stub's default 0x61800000), +0x2C flags (bit 0: enter the rescue for local slot selection,
++         bit 1: broadcast boot diagnostics on Ethernet), +0x30 the kernel's inflated length (0: stored as it is; else +0x14 is the
+          length of its raw deflate stream), +0x40 kernel command line
+   0x200  stub (module/boot, bin linuxboot, linked at 0x61F00000)
+   ...    kernel Image (4 KiB aligned), initramfs (4 KiB aligned)
+@@ -49,10 +49,11 @@
+     ap.add_argument("--cmdline", default="console=ttyS1,115200 mem=32M")
+     ap.add_argument("--mach", type=lambda x: int(x, 0), default=0x270F)
+     ap.add_argument("--initrd-at", type=lambda x: int(x, 0), default=0x61800000)
++    ap.add_argument("--slots", action="store_true", help="enter the rescue initramfs for local system selection")
++    ap.add_argument("--deflate-kernel", action="store_true", help="the kernel as raw deflate: the stub inflates it")
+     ap.add_argument(
+-        "--slots", action="store_true", help="the initramfs is the rescue: the stub asks the MCU for a slot"
++        "--bootlog", action="store_true", help="broadcast boot markers and the initial kernel log on Ethernet"
+     )
+-    ap.add_argument("--deflate-kernel", action="store_true", help="the kernel as raw deflate: the stub inflates it")
+     a = ap.parse_args()
+     stub, kernel = open(a.stub, "rb").read(), open(a.kernel, "rb").read()
+     initrd = open(a.initrd, "rb").read() if a.initrd != "-" else b""
+@@ -64,7 +65,7 @@
+         z = zlib.compressobj(9, zlib.DEFLATED, -15, 9)
+         inflated, kernel = len(kernel), z.compress(kernel) + z.flush()
+     assert len(stub) < MAX_STUB and len(initrd) < 0x61F00000 - a.initrd_at, "initramfs does not fit below the stub"
+-    cmd = a.cmdline.encode() + b"\0"
++    cmd = (a.cmdline + (" x7.bootlog" if a.bootlog else "")).encode() + b"\0"
+     assert len(cmd) <= 0x1C0 - 0x40
+     out = bytearray(struct.pack("<13I", *TRAMPOLINE)).ljust(0x40, b"\0")
+     pad = lambda n: (n + ALIGN - 1) // ALIGN * ALIGN
+@@ -72,7 +73,8 @@
+     i_off = pad(k_off + len(kernel))
+     stub_len = (len(stub) + 3) & ~3
+     out += struct.pack("<4s7I", b"ZLB1", 1, STUB_OFF, stub_len, k_off, len(kernel), i_off, len(initrd))
+-    out += struct.pack("<5I", 0, a.mach, 0 if a.initrd_at == 0x61800000 else a.initrd_at, 1 if a.slots else 0, inflated)
++    flags = int(a.slots) | (int(a.bootlog) << 1)
++    out += struct.pack("<5I", 0, a.mach, 0 if a.initrd_at == 0x61800000 else a.initrd_at, flags, inflated)
+     out = out.ljust(0x80, b"\0") + cmd
+     out = out.ljust(STUB_OFF, b"\0") + stub
+     out = out.ljust(k_off, b"\0") + kernel
+diff --git a/module/os/os.toml b/module/os/os.toml
+--- a/module/os/os.toml
++++ b/module/os/os.toml
+@@ -163,6 +163,8 @@
+ ]
+ # The rescue's: a look around on its console (zd1-init runs it; zd1-slot writes the slots)
+ rescue_applets = [
++  "switch_root",
++  "udhcpc",
+   "ash",
+   "sh",
+   "[",
+@@ -216,19 +218,8 @@
+ # `init` is PID 1 (/sbin/init; the rescue's /init).
+ workspace = "module/os/apps"
+ multicall = "zd1"
+-core = [
+-  "init",
+-  "zd1-linkd",
+-  "zd1-ctl",
+-  "zd1-board",
+-  "zd1-dhcp",
+-  "zd1-entropy",
+-  "zd1-persparam",
+-  "zd1-settings",
+-  "zd1-slot",
+-  "zd1-update",
+-]
+-rescue = ["init", "zd1-linkd", "zd1-ctl", "zd1-board", "zd1-persparam", "zd1-settings", "zd1-slot", "zd1-update"]
++core = ["init", "zd1-ctl", "zd1-board", "zd1-dhcp", "zd1-entropy", "zd1-persparam", "zd1-settings", "zd1-slot"]
++rescue = ["init", "zd1-ctl", "zd1-board", "zd1-dhcp", "zd1-entropy", "zd1-persparam", "zd1-settings", "zd1-slot"]
+ bins = ["zd1-snapcast", "zd1-airplay", "zd1-spotify"]
+ debug = ["zd1-selftest", "zd1-memsh"]
+
+diff --git a/module/os/rootfs/etc/hostname b/module/os/rootfs/etc/hostname
+--- a/module/os/rootfs/etc/hostname
++++ b/module/os/rootfs/etc/hostname
+@@ -1 +1 @@
+-zd1
++srs-x7
+diff --git a/module/os/rootfs/etc/mdev.conf b/module/os/rootfs/etc/mdev.conf
+--- a/module/os/rootfs/etc/mdev.conf
++++ b/module/os/rootfs/etc/mdev.conf
+@@ -1,3 +1,6 @@
+ # busybox mdev (also the hotplug helper): device nodes the defaults don't place right.
++# The Sony driver handoff reuses this minor. Its loader owns the 0600 node
++# so a delayed rescue-driver remove event cannot unlink the replacement.
++x7-spi root:root 600 !
+ # ALSA (snd-sulu): alsa-lib opens /dev/snd/controlC0, /dev/snd/pcmC0D2p, ...
+ (pcm.*|control.*|timer|seq|hwC.*|midi.*) root:root 660 =snd/
+diff --git a/nix/default.nix b/nix/default.nix
+--- a/nix/default.nix
++++ b/nix/default.nix
+@@ -96,6 +96,8 @@
+     "module/codecs"
+     "module/warp0"
+     "module/os/apps"
++    "module/os/debug/prof.c"
++    "x7"
+     "tools/zeppelin/lab/ap2send"
+     "host"
+   ];
+@@ -106,6 +108,7 @@
+     cargoVendorDir = hostCraneLib.vendorMultipleCargoDeps {
+       cargoLockList = [
+         ../Cargo.lock
++        ../x7/Cargo.lock
+         "${rust.passthru.availableComponents.rust-src}/lib/rustlib/src/rust/library/Cargo.lock"
+       ];
+     };
+@@ -135,10 +138,19 @@
+     apps = self.callPackage ./module/apps.nix { };
+     apps-core = self.apps.override { core = true; };
+     apps-debug = self.apps.override { debug = true; };
++    apps-profile = self.apps.override {
++      debug = true;
++      cpuProfile = true;
++    };
++    x7-management = self.callPackage ./module/x7-management.nix { };
+     debug-tools = self.callPackage ./module/debug-tools.nix { };
+   });
+
+   boot = pkgs.callPackage ./boot.nix {
++    inherit llvm workspace;
++    craneLib = hostCraneLib;
++  };
++  x7-kernel = pkgs.callPackage ./x7-kernel.nix {
+     inherit llvm workspace;
+     craneLib = hostCraneLib;
+   };
+@@ -229,6 +241,7 @@
+     inherit
+       llvm
+       boot
++      x7-kernel
+       module-os-parts
+       os-image
+       test-unit
+@@ -246,6 +259,8 @@
+       apps
+       apps-core
+       apps-debug
++      apps-profile
++      x7-management
+       debug-tools
+       ;
+     inherit (mcu)
+@@ -332,7 +347,7 @@
+     clippy-module = module.apps.clippy;
+   };
+
+-  devShells = {
++  devShells = rec {
+     default = pkgs.mkShell {
+       packages = with pkgs; [
+         (python3.withPackages (
+@@ -355,6 +370,10 @@
+       ];
+       ZD1_LLVM = llvm; # module/warp0/mips.py: the Warp tools
+       shellHook = ''export ZD1_REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"'';
++    };
++    emulator = import ../x7/emulator.nix {
++      inherit pkgs;
++      defaultShell = default;
+     };
+     # the module's cross toolchain: $CC (clang for armv5te musl, static) and its linker for `cargo module`
+     cross =
+diff --git a/nix/module/apps.nix b/nix/module/apps.nix
+--- a/nix/module/apps.nix
++++ b/nix/module/apps.nix
+@@ -15,6 +15,7 @@
+   os,
+   core ? false,
+   debug ? false,
++  cpuProfile ? false,
+ }:
+ let
+   common = {
+@@ -55,7 +56,9 @@
+   common
+   // {
+     pname =
+-      if core then
++      if cpuProfile then
++        "zd1-apps-profile"
++      else if core then
+         "zd1-core"
+       else if debug then
+         "zd1-apps-debug"
+@@ -63,7 +66,10 @@
+         "zd1-apps";
+     cargoArtifacts = deps;
+     cargoExtraArgs =
+-      common.cargoExtraArgs + lib.optionalString core " --no-default-features" + lib.optionalString debug " --features debug";
++      common.cargoExtraArgs
++      + lib.optionalString core " --no-default-features"
++      + lib.optionalString debug " --features debug"
++      + lib.optionalString cpuProfile " --features cpu-profile";
+     # clippy on the same build (nix flake check), with every feature: `cargo module` as clippy
+     passthru.clippy = craneLib.cargoClippy (
+       common
+@@ -77,4 +83,13 @@
+       }
+     );
+   }
++  // lib.optionalAttrs cpuProfile {
++    CARGO_PROFILE_MODULE_STRIP = "none";
++    dontStrip = true;
++    postInstall = ''
++      mkdir -p "$out/symbols"
++      cp "$out/bin/zd1" "$out/symbols/zd1"
++      "$STRIP" --strip-all "$out/bin/zd1"
++    '';
++  }
+ )
+diff --git a/nix/module/x7-management.nix b/nix/module/x7-management.nix
+new file mode 100644
+--- /dev/null
++++ b/nix/module/x7-management.nix
+@@ -0,0 +1,32 @@
++{
++  lib,
++  stdenv,
++  buildPackages,
++  craneLib,
++  workspace,
++}:
++craneLib.buildPackage (
++  {
++    pname = "x7-management";
++    version = "0.1.0";
++    inherit (workspace) src cargoVendorDir;
++    cargoArtifacts = null;
++    doCheck = false;
++    strictDeps = true;
++    cargoBuildCommand = "cargo build --manifest-path x7/Cargo.toml --target-dir target --release --target armv5te-unknown-linux-musleabi -Zbuild-std=std,panic_abort -Zbuild-std-features=";
++    cargoExtraArgs = "--locked -p x7-management";
++    cargoCheckCommand = "true";
++    preBuild = "unset NIX_CFLAGS_LINK";
++    installPhaseCommand = ''
++      mkdir -p $out/bin
++      cp target/armv5te-unknown-linux-musleabi/release/x7-management $out/bin/
++    '';
++  }
++  // lib.optionalAttrs (stdenv.buildPlatform.system == "x86_64-linux") {
++    CARGO_UNSTABLE_HOST_CONFIG = "true";
++    CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST = "true";
++    CARGO_TARGET_APPLIES_TO_HOST = "false";
++    CARGO_HOST_LINKER = "${buildPackages.stdenv.cc}/bin/cc";
++    CARGO_HOST_RUSTFLAGS = "-Clinker-features=-lld";
++  }
++)
+diff --git a/nix/x7-kernel.nix b/nix/x7-kernel.nix
+new file mode 100644
+--- /dev/null
++++ b/nix/x7-kernel.nix
+@@ -0,0 +1,23 @@
++{
++  craneLib,
++  llvm,
++  workspace,
++}:
++craneLib.buildPackage {
++  pname = "x7-spi";
++  version = "0.1.0";
++  inherit (workspace) src cargoVendorDir;
++  cargoArtifacts = null;
++  doCheck = false;
++  cargoBuildCommand = "cargo build --manifest-path x7/Cargo.toml --target-dir target --profile kernel --target armv5te-none-eabi -Zbuild-std=core,compiler_builtins -Zbuild-std-features=compiler-builtins-mem";
++  cargoExtraArgs = "--locked -p x7-kernel";
++  nativeBuildInputs = [ llvm ];
++  installPhaseCommand = ''
++    mkdir -p $out/lib
++    ld.lld -r --gc-sections -u init_module -u cleanup_module -u __this_module \
++      -T x7/kernel/kernel.ld --whole-archive target/armv5te-none-eabi/kernel/libx7_kernel.a \
++      --no-whole-archive -o x7-spi-debug.ko
++    llvm-objcopy --strip-debug --remove-section=.llvmbc --remove-section=.llvmcmd \
++      x7-spi-debug.ko $out/lib/x7-spi.ko
++  '';
++}

@@ -11,20 +11,19 @@ describes a 2.1-channel system: two full-range drivers and a subwoofer, with
 32 W total rated output. Its network software supports the original
 AirPlay/RAOP and DLNA generation and later received Spotify support.
 
-The hardware descriptions combine console diagnostics, firmware analysis and
-Sony's service documentation. The console procedure keeps the enclosure closed.
-
 ## Functional architecture
 
-The network module and Sony controller communicate over SPI. Digital audio
-uses a separate interface; its board-level signals and clock routing remain
-unresolved.
+The network module requests a playback source over SPI. Stereo audio travels
+from its AV2 digital output through input selector IC405 to the SSI3 input on
+Sony's Armada controller (IC403). Armada applies the speaker's DSP settings
+and feeds the digital power amplifiers. Playback requires Armada to select
+the network module as the source and release mute.
 
 ```text
 Wi-Fi / Ethernet
        |
-DM870 network module -- separate audio interface -- audio circuitry
-  ARM926 / KnOS
+DM870 network module -- AV2 digital audio --> IC405 --> Armada SSI3
+  ARM926 / stock KnOS or custom Linux
   32 MiB SDRAM / 128 MiB NAND
        |
        | SPI: registers, commands, queued notifications
@@ -43,18 +42,19 @@ protocol. It can notify the controller, which drains pending messages. Each
 CPU has its own address space. The [SPI write-up](spi.md)
 explains the five-byte headers, CRCs, escaping and queue semantics.
 
-## What identifies each component?
+## Board components
 
-| Component | Evidence | Confidence and limit |
-| --- | --- | --- |
-| Network processor | Live console identifies ARM926 and DM870 HAL; clock diagnostics report 240 MHz ARM and 160 MHz Warp/SDRAM | Live observation; exact module/board revision not visually inspected |
-| Network memory | 32 MiB SDRAM, 64 KiB on-chip SRAM; 128 MiB NAND with 2 KiB pages and 64 spare bytes per page | Live descriptors and completed memory/NAND captures |
-| Main controller, IC403 | R7S7200022CFP in Sony's parts list; ARM/Thumb and T-Kernel/RSPI code in exact X7 Armada update | Documentary identification plus static executable evidence; no live controller dump |
-| Serial flash, IC401 | MX25L3235EM2I-10G in parts list; 32 Mbit / 4 MiB part | Documentary; contents remain uncaptured |
-| Apple authentication, IC402 | MFI337S3959 in parts list | Separate trust component; no private-key export |
-| Analogue ADC, IC406 | PCM1808PWR in parts list | Documentary component identity; complete audio routing unverified |
+| Component | Part and function |
+| --- | --- |
+| Network processor | BridgeCo DM870, ARM926 at 240 MHz with Warp/SDRAM at 160 MHz |
+| Network memory | 32 MiB SDRAM, 64 KiB on-chip SRAM and 128 MiB NAND |
+| IC403, main controller | Renesas R7S7200022CFP, runs Sony’s control software |
+| IC401, controller flash | Macronix MX25L3235EM2I-10G, 4 MiB serial flash |
+| IC402, Apple authentication | MFI337S3959 authentication component |
+| IC406, analogue input | PCM1808PWR analogue-to-digital converter |
 
-The component references come from [Sony's service manual, parts page 67](https://www.manualslib.com/manual/3362414/Sony-Srs-X7.html?page=67).
+The audio routing and component identities come from the Sony SRS-X7 service
+manual, main-board diagram on page 29 and parts list on page 67.
 
 ## Boot and software responsibilities
 
@@ -79,7 +79,7 @@ and host-side control. Static dispatchers process network status, version,
 update and AirTunes messages. Monitor initialization reads `TmConsEnable`,
 `TmDebugPort` and `TmBaudRate`. Its enabled state and transport are unresolved.
 
-## Network services observed
+## Network services observed on stock software
 
 Service availability changes with standby, setup mode and runtime state.
 
@@ -95,6 +95,9 @@ Service availability changes with standby, setup mode and runtime state.
 | 50001 | Potential TCP/SPI bridge configuration; not established as an accessible stock register service |
 | 60151 | Album-art image-server role identified in firmware |
 | 2320 | Diagnostic console after the verified patch |
+
+On stock 2.13.2.09, the local Tandem protocol used by SongPal exposes the
+model, firmware version, sound presets, standby settings and battery status.
 
 ## Memory and storage map
 
@@ -136,8 +139,13 @@ network-module view
   device drivers       network, NAND, SPI, audio and other interfaces
 ```
 
-## What a replacement must preserve
+## Controls available to the replacement firmware
 
-Replacement network firmware must implement the Sony controller's boot/status
-handshake, notification queue, version queries, source and volume control,
-mute, power/standby and audio interface. See [firmware requirements](roadmap.md).
+Armada still owns source selection, master volume, mute, equalization and
+power policy. Over the native controller link, Linux can read volume, EQ,
+the two standby settings and a coarse battery category. The battery reply
+does not report pack voltage, temperature, cycle count or battery health.
+
+The five custom EQ bands are centered at 100 Hz, 330 Hz, 1 kHz, 3.3 kHz and
+10 kHz. The controller accepts gains from −6 to +6 dB in 0.6 dB steps.
+The dashboard shows the gain requested for each band.
